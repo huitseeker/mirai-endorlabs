@@ -175,11 +175,25 @@ while seeing the actual rustc sources in the debugger. By default, this does not
 
 ## Testing
 
-Testing is done via `cargo test`. We favor integration tests over unit tests and require every pull request to strive
+Testing is done via `cargo nextest run --locked --workspace`. Install nextest with
+`cargo install cargo-nextest --locked`, or use a prebuilt binary from
+[the nextest installation guide](https://nexte.st/docs/installation/pre-built-binaries/).
+We favor integration tests over unit tests and require every pull request to strive
 for 100% test coverage. (Often this is not possible because the coverage tool is imperfect.)
 
 Before putting up a pull request it is also advisable to run the 'validate.sh' script. This will ensure that the code is
 properly formatted and that Clippy is happy. It also runs MIRAI on itself, which is a kind of stress test.
+
+CI uses `ubuntu-slim` for formatting and workflow validation. Rust builds and
+publication checks run on `ubuntu-26.04-arm`. The test matrix also covers
+`ubuntu-26.04`, `macos-26`, and `windows-2025`. Every job reads the nightly pin
+from `rust-toolchain.toml`. Pushes run `cargo publish --dry-run` for the annotations,
+standard contracts, and checker crates, including compilation of each package.
+
+The default `bundled` feature downloads and statically links Z3 4.15.2 release
+binaries through the published `z3-sys` crate. This avoids compiling Z3 in every
+CI job. These binaries require glibc 2.39 on Linux x86-64 or glibc 2.34 on Linux
+ARM64. The `vcpkg` feature remains available for builds using a local Z3 installation.
 
 # Troubleshooting
 

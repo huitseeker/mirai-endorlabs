@@ -2,56 +2,40 @@ name: MIRAI on MIRAI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
-  build_with_vcpkg_installed_z3:
-    strategy:
-      matrix:
-        build: [ linux, macos, windows ]
-        include:
-          - build: linux
-            os: ubuntu-latest
-            vcpkg_triplet: x64-linux
-          - build: macos
-            os: macos-latest
-            vcpkg_triplet: arm64-osx
-          - build: windows
-            os: windows-latest
-            vcpkg_triplet: x64-windows-static-md
-    runs-on: ${{ matrix.os }}
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+  self-analysis:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
-      - name: Install LLVM and Clang # required for bindgen to work, see https://github.com/rust-lang/rust-bindgen/issues/1797
-        uses: KyleMayes/install-llvm-action@v1
-        if: matrix.os == 'windows-latest'
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          version: "11.0"
-          directory: ${{ runner.temp }}/llvm
-      - name: Set LIBCLANG_PATH
-        run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
-        if: matrix.os == 'windows-latest'
-      - run: echo  Installing z3:${{ matrix.vcpkg_triplet }} on ${{ matrix.os }}.
-      - name: vcpkg build z3
-        uses: johnwason/vcpkg-action@v5
-        id: vcpkg
-        with:
-          pkgs: z3
-          triplet: ${{ matrix.vcpkg_triplet }}
-          cache-key: ${{ matrix.os }}
-          revision: master
-          token: ${{ github.token }}
-          extra-args: --clean-buildtrees-after-build
-      - name: Install MIRAI
-        run: |
-          cargo install --force --path ./checker --no-default-features --features=vcpkg
+          shared-key: native
+      - name: Build MIRAI with the bundled solver
+        run: cargo build --locked -p mirai
       - name: Run MIRAI on MIRAI
         run: |
-          cargo mirai --no-default-features --features=vcpkg
-        if: matrix.os != 'windows-latest'
+          mkdir -p "$RUNNER_TEMP/mirai-bin"
+          cp target/debug/mirai target/debug/cargo-mirai "$RUNNER_TEMP/mirai-bin/"
+          export PATH="$RUNNER_TEMP/mirai-bin:$PATH"
+          cargo mirai --locked --manifest-path checker/Cargo.toml --no-default-features

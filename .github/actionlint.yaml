@@ -1,0 +1,5 @@
+# GitHub-hosted Ubuntu 26.04 labels are not yet in actionlint 1.7.12's catalog.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm

@@ -492,7 +492,7 @@ impl<'tcx> SummaryCache<'tcx> {
             {
                 let tar_path = directory_path.join(".summary_store.tar");
                 let mut tar_file = File::create(tar_path.clone()).unwrap();
-                let bytes = include_bytes!("../../binaries/summary_store.tar");
+                let bytes = include_bytes!("../binaries/summary_store.tar");
                 tar_file.write_all(bytes).unwrap();
                 let tar_file = File::open(tar_path).unwrap();
                 let mut ar = Archive::new(tar_file);
@@ -652,7 +652,7 @@ impl<'tcx> SummaryCache<'tcx> {
                             if summary.is_none() {
                                 info!(
                                     "Summary store has no entry for {}{}",
-                                    &func_ref.summary_cache_key, &func_ref.argument_type_key
+                                    func_ref.summary_cache_key, func_ref.argument_type_key
                                 );
                             };
                             summary.unwrap_or_default()

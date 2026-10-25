@@ -20,24 +20,13 @@ cargo fmt --all
 # Run lint checks
 cargo audit
 cargo clippy --no-default-features --all-targets -- -D warnings
-# Build mirai (in debug mode) so that we can build the standard contracts
-cargo build --no-default-features
+# Build MIRAI and regenerate the seed summaries for the current Cargo layout.
+./rebuild_std.sh
 
-# build the mirai-standard-contracts crate
-touch standard_contracts/src/lib.rs
-cargo build --lib -p mirai-standard-contracts
-touch standard_contracts/src/lib.rs
-RUSTC_WRAPPER=target/debug/mirai RUST_BACKTRACE=1 MIRAI_LOG=warn MIRAI_START_FRESH=true MIRAI_SHARE_PERSISTENT_STORE=true MIRAI_FLAGS="--diag=paranoid" cargo build --lib -p mirai-standard-contracts
-
-# collect the summary store into a tar file
-cd target/debug/deps
-tar -c -f ../../../binaries/summary_store.tar .summary_store.sled
-cd ../../..
-
-# Run cargo test, starting clean so that the new summary store is used.
+# Run nextest, starting clean so that the new summary store is used.
 cargo clean
 cargo build --tests $FLAGS
-time cargo test $FLAGS
+time cargo nextest run $FLAGS
 
 # Install MIRAI into cargo so that we can use optimized binaries to analyze debug binaries built with special flags
 cargo uninstall mirai || true

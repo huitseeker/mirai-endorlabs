@@ -126,6 +126,13 @@ fn find_extern_library(base_name: &str, proc_macro: bool) -> String {
         if !entry.file_type().is_file() {
             continue;
         };
+        // Cargo can leave empty metadata placeholders beside artifacts from packaging.
+        if entry
+            .metadata()
+            .map_or(true, |metadata| metadata.len() == 0)
+        {
+            continue;
+        }
         let file_name = entry.file_name().to_str().unwrap_or("");
         // Windows omits the lib prefix for proc macros.
         if !file_name.starts_with(format!("lib{base_name}").as_str())

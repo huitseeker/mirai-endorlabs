@@ -4,7 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Use this script to update the seed summary store in mirai/binaries/summary_store.tar
+# Use this script to update checker/binaries/summary_store.tar.
 
 # Exit immediately if a command exits with a non-zero status.
 set -euo pipefail
@@ -37,4 +37,4 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
 raise SystemExit("standard contracts metadata artifact was not produced")
 PY
 )
-tar -C "$summary_dir" -c -f binaries/summary_store.tar .summary_store.sled
+tar -C "$summary_dir" -c -f checker/binaries/summary_store.tar .summary_store.sled

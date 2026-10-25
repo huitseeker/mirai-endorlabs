@@ -36,7 +36,7 @@ itertools = "*"
 lazy_static = "*"
 log = "*"
 log-derive = "*"
-mirai-annotations = { path = "../annotations" }
+mirai-annotations = { version = "1.12.1", path = "../annotations" }
 petgraph = "*"
 proc-macro2 = "*"
 rand = "*"
@@ -49,7 +49,7 @@ shellwords = "*"
 sled = "*"
 tar = "*"
 tempfile = "*"
-z3-sys = { version = "*", git = "https://github.com/prove-rs/z3.rs.git", rev = "cb10013a2a0a017048b1d218bc734afa390f34ff", optional = true }
+z3-sys = { version = "=0.9.10", optional = true }
 
 [dev-dependencies]
 rayon = "*"
@@ -67,7 +67,8 @@ contracts = { version = "*", features = ["mirai_assertions"] }
 [features]
 default = ["bundled"]
 vcpkg = ["z3-sys/vcpkg", "z3"]
-bundled = ["z3-sys/bundled", "z3"]
+# Link a static Z3 release without compiling the solver during each installation.
+bundled = ["z3-sys/gh-release", "z3"]
 z3 = []
 
 [package.metadata.rust-analyzer]

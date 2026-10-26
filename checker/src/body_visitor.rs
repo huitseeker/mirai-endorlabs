@@ -2479,6 +2479,13 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
 
     /// Evaluates the length value of an Array type and returns its value as usize
     pub fn get_array_length(&self, length: &'tcx Const<'tcx>) -> usize {
+        let length = self
+            .tcx
+            .try_normalize_erasing_regions(
+                self.type_visitor().get_typing_env(),
+                rustc_middle::ty::Unnormalized::new(*length),
+            )
+            .unwrap_or(*length);
         length
             .try_to_target_usize(self.tcx)
             .expect("Array length constant to have a known value") as usize

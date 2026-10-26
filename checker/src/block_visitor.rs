@@ -11,7 +11,7 @@ use std::rc::Rc;
 use log_derive::*;
 
 use mirai_annotations::*;
-use rustc_abi::{FieldIdx, Primitive, TagEncoding, VariantIdx, Variants};
+use rustc_abi::{Endian, FieldIdx, Primitive, TagEncoding, VariantIdx, Variants};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir;
@@ -3315,31 +3315,31 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 if let Ok(enum_ty_layout) = self.type_visitor().layout_of(ty) {
                     trace!("enum_ty_layout {:?}", enum_ty_layout);
                     let len = enum_ty_layout.size.bytes_usize();
-                    let tag_length;
-                    let data = if len == 0 {
-                        tag_length = 0;
-                        0
-                    } else if len < 2 {
-                        tag_length = 1;
-                        bytes[0] as u128
-                    } else if len < 4 {
-                        tag_length = 2;
-                        u16::from_ne_bytes(*bytes.as_chunks().0.iter().next().unwrap()) as u128
-                    } else if len < 8 {
-                        tag_length = 4;
-                        u32::from_ne_bytes(*bytes.as_chunks().0.iter().next().unwrap()) as u128
-                    } else if len < 16 {
-                        tag_length = 8;
-                        u64::from_ne_bytes(*bytes.as_chunks().0.iter().next().unwrap()) as u128
+                    let data = if let Variants::Multiple { tag, tag_field, .. } =
+                        &enum_ty_layout.variants
+                    {
+                        let offset = enum_ty_layout
+                            .fields
+                            .offset(tag_field.as_usize())
+                            .bytes_usize();
+                        let size = tag.primitive().size(&self.bv.tcx).bytes_usize();
+                        let tag_bytes = &bytes[offset..offset + size];
+                        let mut scalar_bytes = [0; 16];
+                        match self.bv.tcx.data_layout.endian {
+                            Endian::Little => {
+                                scalar_bytes[..size].copy_from_slice(tag_bytes);
+                                u128::from_le_bytes(scalar_bytes)
+                            }
+                            Endian::Big => {
+                                scalar_bytes[16 - size..].copy_from_slice(tag_bytes);
+                                u128::from_be_bytes(scalar_bytes)
+                            }
+                        }
                     } else {
-                        tag_length = 16;
-                        u128::from_ne_bytes(*bytes.as_chunks().0.iter().next().unwrap())
+                        0
                     };
                     let (discr_signed, discr_bits, discr_index, discr_has_data) =
                         self.get_discriminator_info(data, &enum_ty_layout);
-                    if !discr_has_data {
-                        bytes_left_to_deserialize = &bytes[tag_length..];
-                    }
                     let discr_path = Path::new_discriminant(target_path.clone());
                     let discr_data = if discr_signed {
                         self.get_i128_const_val(discr_bits as i128)
@@ -3366,6 +3366,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                             );
                         }
                     }
+                    bytes_left_to_deserialize = &bytes[len..];
                 }
                 bytes_left_to_deserialize
             }
@@ -3408,17 +3409,13 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 self.bv.update_value_at(target_path, Rc::new(val));
                 &bytes[1..]
             }
-            TyKind::Char => unsafe {
-                let ch_ptr = bytes.as_ptr() as *const char;
-                let ch = self
-                    .bv
-                    .cv
-                    .constant_value_cache
-                    .get_char_for(ch_ptr.read_unaligned())
-                    .clone();
+            TyKind::Char => {
+                let bits = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+                let ch = char::from_u32(bits).expect("invalid character constant");
+                let ch = self.bv.cv.constant_value_cache.get_char_for(ch).clone();
                 self.bv.update_value_at(target_path, Rc::new(ch.into()));
                 &bytes[4..]
-            },
+            }
             TyKind::Int(IntTy::Isize) => unsafe {
                 let int_ptr = bytes.as_ptr() as *const isize;
                 let i = self

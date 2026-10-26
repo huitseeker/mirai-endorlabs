@@ -37,3 +37,10 @@ pub fn pass_constant_by_value() {
 }
 
 pub fn main() {}
+
+pub fn niche_tag_after_tuple_field() {
+    const VALUES: [Option<(usize, char)>; 2] = [None, None];
+    let values = VALUES;
+    verify!(values[0].is_none());
+    verify!(values[1].is_none());
+}

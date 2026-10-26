@@ -3239,6 +3239,38 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         );
                         AbstractValue::make_reference(array_path)
                     }
+                    TyKind::Ref(_, t, _) if crate::type_visitor::is_transparent_wrapper(*t) => {
+                        let wrapper_type = *t;
+                        let slice_type =
+                            self.type_visitor().remove_transparent_wrapper(wrapper_type);
+                        let TyKind::Slice(elem_type) = slice_type.kind() else {
+                            assume_unreachable!(
+                                "ConstValue::Slice with transparent wrapper type {:?}",
+                                lty
+                            );
+                        };
+                        let bytes_per_elem = self.type_visitor().get_type_size(*elem_type);
+                        checked_assume!(bytes_per_elem > 0);
+                        let length = size.bytes() / bytes_per_elem;
+                        let (_, elem_alignment) =
+                            self.type_visitor().get_type_size_and_alignment(*elem_type);
+                        let byte_len_value = self.get_u128_const_val(size.bytes() as u128);
+                        let alignment = self.get_u128_const_val(elem_alignment);
+                        let (_, wrapper_path) = self.bv.get_new_heap_block(
+                            byte_len_value,
+                            alignment,
+                            false,
+                            wrapper_type,
+                        );
+                        let slice_path = Path::new_field(wrapper_path.clone(), 0);
+                        self.deserialize_constant_array(
+                            slice_path,
+                            bytes,
+                            length as usize,
+                            *elem_type,
+                        );
+                        AbstractValue::make_reference(wrapper_path)
+                    }
                     TyKind::Ref(_, t, _) if matches!(t.kind(), TyKind::Str) => {
                         let s = std::str::from_utf8(slice).expect("non utf8 str");
                         let string_const = &mut self.bv.cv.constant_value_cache.get_string_for(s);

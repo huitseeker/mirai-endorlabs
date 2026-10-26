@@ -354,14 +354,11 @@ fn invoke_driver(
 // Parse expected or actual output into a map
 // from trimmed non-emptylines to counts.
 fn build_output_counter(output: &str) -> HashMap<&str, u32> {
-    let items: Vec<&str> = Vec::from_iter(
-        output
-            .split('\n')
-            .collect::<Vec<&str>>()
-            .iter()
-            .filter(|x| !x.is_empty())
-            .map(|x| x.trim()),
-    );
+    let items: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
     let mut counter = HashMap::<&str, u32>::new();
     for item in items.iter() {
         *counter.entry(item).or_insert(0) += 1;
@@ -376,6 +373,17 @@ fn compare_lines(actual: &str, expected: &str) -> bool {
     let actual_counter = build_output_counter(actual);
     let expected_counter = build_output_counter(expected);
     actual_counter == expected_counter
+}
+
+#[test]
+fn call_graph_snapshots_ignore_line_endings() {
+    let actual = "digraph {\n    0 -> 1\n}\n";
+    let expected = "\r\ndigraph {\r\n    0 -> 1\r\n}\r\n";
+    assert!(compare_lines(actual, expected));
+    assert!(!compare_lines(
+        actual,
+        "digraph {\n    0 -> 1\n    0 -> 1\n}\n"
+    ));
 }
 
 fn normalize_call_site_ids(output: &str) -> String {

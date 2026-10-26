@@ -29,9 +29,16 @@ jobs:
         id: rust
         with:
           components: rustfmt
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
-        with:
-          tool: actionlint@1.7.12
+      - name: Install actionlint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          gh release download v1.7.12 --repo rhysd/actionlint \
+            --pattern actionlint_1.7.12_linux_amd64.tar.gz --dir "$RUNNER_TEMP/actionlint"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint/actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint/actionlint_1.7.12_linux_amd64.tar.gz" -C "$RUNNER_TEMP/actionlint" actionlint
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
       - name: Check formatting
         run: cargo +${{ steps.rust.outputs.toolchain }} fmt --all -- --check
       - name: Check workflows

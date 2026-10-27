@@ -15,7 +15,7 @@ use rustc_abi::{Endian, FieldIdx, Primitive, TagEncoding, VariantIdx, Variants};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir;
-use rustc_middle::mir::interpret::{alloc_range, GlobalAlloc, Scalar};
+use rustc_middle::mir::interpret::{alloc_range, ConstAllocation, GlobalAlloc, Scalar};
 use rustc_middle::mir::{ConstValue, UnwindTerminateReason};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::consts::ConstExt;
@@ -48,6 +48,18 @@ use crate::utils;
 /// Holds the state for the basic block visitor
 pub struct BlockVisitor<'block, 'analysis, 'compilation, 'tcx> {
     pub bv: &'block mut BodyVisitor<'analysis, 'compilation, 'tcx>,
+}
+
+struct ConstantAllocationContext<'a, 'tcx> {
+    allocation: ConstAllocation<'tcx>,
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl ConstantAllocationContext<'_, '_> {
+    fn offset_of(&self, bytes: &[u8]) -> usize {
+        self.offset + (bytes.as_ptr() as usize - self.bytes.as_ptr() as usize)
+    }
 }
 
 impl Debug for BlockVisitor<'_, '_, '_, '_> {
@@ -3308,14 +3320,23 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 let bytes = alloc
                     .inner()
                     .inspect_with_uninit_and_ptr_outside_interpreter(offset_bytes..alloc_len);
+                let allocation = ConstantAllocationContext {
+                    allocation: alloc,
+                    bytes,
+                    offset: offset_bytes,
+                };
                 let (heap_val, target_path) = self.bv.get_new_heap_block(
                     Rc::new((num_bytes as u128).into()),
                     Rc::new(1u128.into()),
                     false,
                     lty,
                 );
-                let bytes_left_to_deserialize =
-                    self.deserialize_constant_bytes(target_path, bytes, lty);
+                let bytes_left_to_deserialize = self.deserialize_constant_bytes_with_allocation(
+                    target_path,
+                    bytes,
+                    lty,
+                    Some(&allocation),
+                );
                 if !bytes_left_to_deserialize.is_empty() {
                     debug!("span: {:?}", self.bv.current_span);
                     debug!("type kind {:?}", lty.kind());
@@ -3336,10 +3357,25 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         bytes: &'a [u8],
         ty: Ty<'tcx>,
     ) -> &'a [u8] {
+        self.deserialize_constant_bytes_with_allocation(target_path, bytes, ty, None)
+    }
+
+    fn deserialize_constant_bytes_with_allocation<'a>(
+        &mut self,
+        target_path: Rc<Path>,
+        bytes: &'a [u8],
+        ty: Ty<'tcx>,
+        allocation: Option<&ConstantAllocationContext<'_, 'tcx>>,
+    ) -> &'a [u8] {
         self.type_visitor_mut()
             .set_path_rustc_type(target_path.clone(), ty);
         match ty.kind() {
-            TyKind::Pat(base, _) => self.deserialize_constant_bytes(target_path, bytes, *base),
+            TyKind::Pat(base, _) => self.deserialize_constant_bytes_with_allocation(
+                target_path,
+                bytes,
+                *base,
+                allocation,
+            ),
             TyKind::Adt(def, args) if def.is_enum() => {
                 trace!("deserializing {:?} {:?}", def, args);
                 trace!("def.repr() {:?}", def.repr());
@@ -3391,11 +3427,13 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                                 "field ty layout {:?}",
                                 self.type_visitor().layout_of(field_ty)
                             );
-                            bytes_left_to_deserialize = self.deserialize_constant_bytes(
-                                field_path,
-                                bytes_left_to_deserialize,
-                                field_ty,
-                            );
+                            bytes_left_to_deserialize = self
+                                .deserialize_constant_bytes_with_allocation(
+                                    field_path,
+                                    bytes_left_to_deserialize,
+                                    field_ty,
+                                    allocation,
+                                );
                         }
                     }
                     bytes_left_to_deserialize = &bytes[len..];
@@ -3418,8 +3456,13 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         } else {
                             bytes_left_to_deserialize
                         };
-                        bytes_left_to_deserialize =
-                            self.deserialize_constant_bytes(field_path, field_bytes, field_ty);
+                        bytes_left_to_deserialize = self
+                            .deserialize_constant_bytes_with_allocation(
+                                field_path,
+                                field_bytes,
+                                field_ty,
+                                allocation,
+                            );
                     }
                 }
                 if let Some(layout) = layout {
@@ -3430,7 +3473,13 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             }
             TyKind::Array(elem_type, length) => {
                 let length = self.bv.get_array_length(length);
-                self.deserialize_constant_array(target_path, bytes, length, *elem_type)
+                self.deserialize_constant_array_with_allocation(
+                    target_path,
+                    bytes,
+                    length,
+                    *elem_type,
+                    allocation,
+                )
             }
             TyKind::Bool => {
                 let val = if bytes[0] == 0 {
@@ -3565,7 +3614,62 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 &bytes[8..]
             },
             TyKind::Ref(_, t, _) if matches!(t.kind(), TyKind::Str) => {
-                let s = std::str::from_utf8(bytes).expect("string should be serialized as utf8");
+                let pointer_size = self.bv.tcx.data_layout.pointer_size().bytes_usize();
+                let Some(allocation) = allocation else {
+                    debug!("missing allocation metadata for string constant");
+                    self.bv.update_value_at(
+                        target_path,
+                        Rc::new(ConstantDomain::Unimplemented.into()),
+                    );
+                    return &bytes[pointer_size * 2..];
+                };
+                let pointer_offset = allocation.offset_of(bytes);
+                let Some(provenance) = allocation
+                    .allocation
+                    .inner()
+                    .provenance()
+                    .get_ptr(rustc_abi::Size::from_bytes(pointer_offset))
+                else {
+                    debug!("missing pointer provenance for string constant");
+                    self.bv.update_value_at(
+                        target_path,
+                        Rc::new(ConstantDomain::Unimplemented.into()),
+                    );
+                    return &bytes[pointer_size * 2..];
+                };
+                let read_usize = |bytes: &[u8]| {
+                    let mut scalar_bytes = [0; 16];
+                    match self.bv.tcx.data_layout.endian {
+                        Endian::Little => {
+                            scalar_bytes[..pointer_size].copy_from_slice(&bytes[..pointer_size]);
+                            u128::from_le_bytes(scalar_bytes)
+                        }
+                        Endian::Big => {
+                            scalar_bytes[16 - pointer_size..]
+                                .copy_from_slice(&bytes[..pointer_size]);
+                            u128::from_be_bytes(scalar_bytes)
+                        }
+                    }
+                };
+                let string_offset = read_usize(bytes) as usize;
+                let string_len = read_usize(&bytes[pointer_size..]) as usize;
+                let string_alloc = self
+                    .bv
+                    .tcx
+                    .global_alloc(provenance.alloc_id())
+                    .unwrap_memory();
+                let string_bytes = string_alloc
+                    .inner()
+                    .get_bytes_strip_provenance(
+                        &self.bv.tcx,
+                        alloc_range(
+                            rustc_abi::Size::from_bytes(string_offset),
+                            rustc_abi::Size::from_bytes(string_len),
+                        ),
+                    )
+                    .expect("string allocation should not contain pointers");
+                let s = std::str::from_utf8(string_bytes)
+                    .expect("string constant should be serialized as utf8");
                 let string_const = &mut self.bv.cv.constant_value_cache.get_string_for(s);
                 let string_val: Rc<AbstractValue> = Rc::new(string_const.clone().into());
                 let len_val: Rc<AbstractValue> =
@@ -3579,13 +3683,18 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
 
                 self.bv
                     .update_value_at(target_path, AbstractValue::make_reference(str_path));
-                &[]
+                &bytes[pointer_size * 2..]
             }
             TyKind::RawPtr(..) | TyKind::Ref(..) => {
                 // serialized pointers are not the values pointed to, just some number.
                 // todo: figure out how to deference that number and deserialize the
                 // value to which this pointer refers.
-                self.deserialize_constant_bytes(target_path, bytes, self.bv.tcx.types.usize)
+                self.deserialize_constant_bytes_with_allocation(
+                    target_path,
+                    bytes,
+                    self.bv.tcx.types.usize,
+                    allocation,
+                )
             }
             TyKind::Slice(elem_type) => {
                 let elem_size = self.type_visitor().get_type_size(*elem_type) as usize;
@@ -3620,8 +3729,12 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     } else {
                         bytes_left_deserialize
                     };
-                    bytes_left_deserialize =
-                        self.deserialize_constant_bytes(field_path, field_bytes, field_ty);
+                    bytes_left_deserialize = self.deserialize_constant_bytes_with_allocation(
+                        field_path,
+                        field_bytes,
+                        field_ty,
+                        allocation,
+                    );
                 }
                 if let Some(layout) = layout {
                     &bytes[layout.size.bytes_usize()..]
@@ -3697,12 +3810,27 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         len: usize,
         elem_ty: Ty<'tcx>,
     ) -> &'a [u8] {
+        self.deserialize_constant_array_with_allocation(target_path, bytes, len, elem_ty, None)
+    }
+
+    fn deserialize_constant_array_with_allocation<'a>(
+        &mut self,
+        target_path: Rc<Path>,
+        bytes: &'a [u8],
+        len: usize,
+        elem_ty: Ty<'tcx>,
+        allocation: Option<&ConstantAllocationContext<'_, 'tcx>>,
+    ) -> &'a [u8] {
         let mut bytes_left_deserialize = bytes;
         for i in 0..len {
             let elem_path =
                 Path::new_index(target_path.clone(), self.get_u128_const_val(i as u128));
-            bytes_left_deserialize =
-                self.deserialize_constant_bytes(elem_path, bytes_left_deserialize, elem_ty);
+            bytes_left_deserialize = self.deserialize_constant_bytes_with_allocation(
+                elem_path,
+                bytes_left_deserialize,
+                elem_ty,
+                allocation,
+            );
         }
         let length_path = Path::new_length(target_path);
         let length_value = self.get_u128_const_val(len as u128);

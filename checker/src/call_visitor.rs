@@ -475,6 +475,9 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     pub fn handled_as_special_function_call(&mut self) -> bool {
         self.unpack_allocator_arguments();
         match self.callee_known_name {
+            KnownNames::StdArrayFromFn => {
+                return self.handle_array_from_fn();
+            }
             KnownNames::StdCloneClone => {
                 checked_assume!(self.actual_argument_types.len() == 1);
                 return self.handled_clone();
@@ -664,6 +667,129 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
         }
         false
+    }
+
+    /// Model `array::from_fn` at its call site so that each closure invocation receives a
+    /// concrete index and writes only the corresponding result element.
+    fn handle_array_from_fn(&mut self) -> bool {
+        checked_assume!(self.actual_args.len() == 1);
+        checked_assume!(self.actual_argument_types.len() == 1);
+
+        let result_type = self
+            .type_visitor()
+            .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
+        let TyKind::Array(_, length) = result_type.kind() else {
+            return false;
+        };
+        let length = self.block_visitor.bv.get_array_length(length);
+        if length >= k_limits::MAX_ELEMENTS_TO_TRACK {
+            return false;
+        }
+
+        let closure = self.actual_args[0].clone();
+        let closure_type = self.actual_argument_types[0];
+        let Some(func_ref) = self.block_visitor.get_func_ref(&closure.1) else {
+            return false;
+        };
+        let Some(def_id) = func_ref.def_id else {
+            return false;
+        };
+        let generic_arguments = match closure_type.kind() {
+            TyKind::Closure(_, args) => Some(self.type_visitor().specialize_generic_args(
+                args.as_closure().args,
+                &self.type_visitor().generic_argument_map,
+            )),
+            _ => return false,
+        };
+        let tcx = self.block_visitor.bv.tcx;
+        let closure_argument_type = Ty::new_mut_ref(tcx, tcx.lifetimes.re_static, closure_type);
+        let closure_reference = AbstractValue::make_reference(closure.0.clone());
+        let closure_argument = (
+            Path::get_as_path(closure_reference.clone()),
+            closure_reference,
+        );
+        let actual_argument_types = vec![closure_argument_type, tcx.types.usize];
+        let argument_map = generic_arguments.and_then(|args| {
+            self.type_visitor()
+                .get_generic_arguments_map(def_id, args, &actual_argument_types)
+        });
+        let preflight_index: Rc<AbstractValue> = Rc::new(0_u128.into());
+        let preflight_args = vec![
+            closure_argument.clone(),
+            (Path::new_computed(preflight_index.clone()), preflight_index),
+        ];
+        let function_constant_args = self
+            .block_visitor
+            .get_function_constant_args(&preflight_args, &actual_argument_types);
+        let environment_before_call = self.block_visitor.bv.current_environment.clone();
+        let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
+        let mut preflight_call_visitor = CallVisitor::new(
+            &mut block_visitor,
+            def_id,
+            generic_arguments,
+            argument_map.clone(),
+            environment_before_call,
+            ConstantDomain::Function(func_ref.clone()),
+        );
+        preflight_call_visitor.actual_args = preflight_args;
+        preflight_call_visitor.actual_argument_types = actual_argument_types.clone();
+        preflight_call_visitor.function_constant_args = &function_constant_args;
+        preflight_call_visitor.callee_fun_val = closure.1.clone();
+        let Some(summary) = preflight_call_visitor.get_function_summary() else {
+            return false;
+        };
+        if !summary.is_computed || summary.is_incomplete {
+            return false;
+        }
+
+        let result_path = self.block_visitor.visit_rh_place(&self.destination);
+        self.block_visitor.bv.update_value_at(
+            Path::new_length(result_path.clone()),
+            Rc::new((length as u128).into()),
+        );
+
+        for index in 0..length {
+            let index_value: Rc<AbstractValue> = Rc::new((index as u128).into());
+            let actual_args = vec![
+                closure_argument.clone(),
+                (Path::new_computed(index_value.clone()), index_value.clone()),
+            ];
+            let environment_before_call = self.block_visitor.bv.current_environment.clone();
+            let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
+            let mut closure_call_visitor = CallVisitor::new(
+                &mut block_visitor,
+                def_id,
+                generic_arguments,
+                argument_map.clone(),
+                environment_before_call,
+                ConstantDomain::Function(func_ref.clone()),
+            );
+            closure_call_visitor.actual_args = actual_args;
+            closure_call_visitor.actual_argument_types = actual_argument_types.clone();
+            closure_call_visitor.callee_fun_val = closure.1.clone();
+            closure_call_visitor.target = self.target;
+            let element_path = Path::new_index(result_path.clone(), index_value);
+            closure_call_visitor
+                .check_preconditions_if_necessary_for_result(&summary, &Some(element_path.clone()));
+            if closure_call_visitor.block_visitor.bv.analysis_is_incomplete {
+                return true;
+            }
+            closure_call_visitor
+                .transfer_and_refine_normal_return_state_to_path(&summary, element_path.clone());
+            if closure_call_visitor.block_visitor.bv.analysis_is_incomplete {
+                return true;
+            }
+            closure_call_visitor.add_post_condition_to_exit_conditions_for_result(
+                &summary,
+                &Some(element_path),
+                index > 0,
+            );
+        }
+
+        if length == 0 {
+            self.use_entry_condition_as_exit_condition();
+        }
+        true
     }
 
     fn unpack_allocator_arguments(&mut self) {
@@ -2756,6 +2882,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     /// then check the preconditions and report any conditions that are not known to hold at this point.
     #[logfn_inputs(TRACE)]
     pub fn check_preconditions_if_necessary(&mut self, function_summary: &Summary) {
+        let result = Some(self.block_visitor.visit_rh_place(&self.destination));
+        self.check_preconditions_if_necessary_for_result(function_summary, &result);
+    }
+
+    fn check_preconditions_if_necessary_for_result(
+        &mut self,
+        function_summary: &Summary,
+        result: &Option<Rc<Path>>,
+    ) {
         if self.block_visitor.bv.check_for_errors
             && self
                 .block_visitor
@@ -2771,7 +2906,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .already_reported_errors_for_call_to
                 .contains(&self.callee_fun_val)
         {
-            self.check_function_preconditions(function_summary);
+            self.check_function_preconditions(function_summary, result);
         } else {
             if let Some(fr) = &self.callee_func_ref {
                 if fr.summary_cache_key.ends_with(".deref") {
@@ -2788,15 +2923,18 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     /// Preconditions that are maybe false become preconditions of the calling function
     /// unless the calling function is an analysis root, in which case a diagnostic message is issued.
     #[logfn_inputs(TRACE)]
-    fn check_function_preconditions(&mut self, function_summary: &Summary) {
+    fn check_function_preconditions(
+        &mut self,
+        function_summary: &Summary,
+        result: &Option<Rc<Path>>,
+    ) {
         verify!(self.block_visitor.bv.check_for_errors);
         // A precondition can refer to the result if the precondition prevents the result expression
         // from overflowing.
-        let result = Some(self.block_visitor.visit_rh_place(&self.destination));
         for precondition in &function_summary.preconditions {
             let mut refined_condition = precondition.condition.refine_parameters_and_paths(
                 &self.actual_args,
-                &result,
+                result,
                 &self.environment_before_call,
                 &self.block_visitor.bv.current_environment,
                 self.block_visitor.bv.fresh_variable_offset,
@@ -3038,6 +3176,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     pub fn transfer_and_refine_normal_return_state(&mut self, function_summary: &Summary) {
         // Assign function result to place
         let target_path = self.block_visitor.visit_rh_place(&self.destination);
+        self.transfer_and_refine_normal_return_state_to_path(function_summary, target_path);
+    }
+
+    fn transfer_and_refine_normal_return_state_to_path(
+        &mut self,
+        function_summary: &Summary,
+        target_path: Rc<Path>,
+    ) {
         let result_path = &Some(target_path.clone());
         // If the summary has a concrete type for the return result, use that type rather
         // than the possibly abstract type of the target path.
@@ -3147,6 +3293,56 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .current_environment
                 .entry_condition
                 .clone();
+            if exit_condition.as_bool_if_known().unwrap_or(true) {
+                if let Some(post_condition) = &function_summary.post_condition {
+                    let refined_post_condition = post_condition.refine_parameters_and_paths(
+                        &self.actual_args,
+                        result_path,
+                        &self.environment_before_call,
+                        &self.block_visitor.bv.current_environment,
+                        self.block_visitor.bv.fresh_variable_offset,
+                    );
+                    trace!("refined post condition {:?}", refined_post_condition);
+                    exit_condition = exit_condition.and(refined_post_condition);
+                    trace!("post exit conditions {:?}", exit_condition);
+                }
+            }
+            self.block_visitor
+                .bv
+                .current_environment
+                .exit_conditions
+                .insert_mut(*target, exit_condition);
+        }
+    }
+
+    fn add_post_condition_to_exit_conditions_for_result(
+        &mut self,
+        function_summary: &Summary,
+        result_path: &Option<Rc<Path>>,
+        accumulate: bool,
+    ) {
+        if let Some(target) = &self.target {
+            let mut exit_condition = if accumulate {
+                self.block_visitor
+                    .bv
+                    .current_environment
+                    .exit_conditions
+                    .get(target)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.block_visitor
+                            .bv
+                            .current_environment
+                            .entry_condition
+                            .clone()
+                    })
+            } else {
+                self.block_visitor
+                    .bv
+                    .current_environment
+                    .entry_condition
+                    .clone()
+            };
             if exit_condition.as_bool_if_known().unwrap_or(true) {
                 if let Some(post_condition) = &function_summary.post_condition {
                     let refined_post_condition = post_condition.refine_parameters_and_paths(

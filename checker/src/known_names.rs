@@ -168,6 +168,7 @@ pub enum KnownNames {
     StdSliceCmpMemcmp,
     RustNoAllocShimIsUnstable,
     StdIntrinsicsAtomicXchg,
+    StdArrayFromFn,
 }
 
 /// An analysis lifetime cache that contains a map from def ids to known names.
@@ -265,6 +266,12 @@ fn known_name_for_std_lib(path_segments: &[DisambiguatedDefPathData]) -> Option<
     match path_segments {
         [current_segment, tail_segments @ ..] => match name_from_type_ns(current_segment)? {
             "alloc" => get_known_name_for_alloc_namespace(tail_segments),
+            "array" => known_name_for_terminal_from_ns!(
+                tail_segments,
+                DefPathData::ValueNs,
+                "from_fn",
+                KnownNames::StdArrayFromFn
+            ),
             "clone" => get_known_name_for_clone_namespace(tail_segments),
             "future" => known_name_for_terminal_from_ns!(
                 tail_segments,

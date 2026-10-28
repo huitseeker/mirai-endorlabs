@@ -2047,6 +2047,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         source_path: Rc<Path>,
         target_path: Rc<Path>,
         source_element_type: Ty<'tcx>,
+        source_length: Option<usize>,
         target_type: Ty<'tcx>,
     ) -> bool {
         let TyKind::Adt(target_def, target_args) = target_type.kind() else {
@@ -2055,12 +2056,22 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         if !target_def.is_struct() || !target_def.repr().c() {
             return false;
         }
-        let target_length = target_def.non_enum_variant().fields.len();
-        if !(0..target_length).all(|i| {
-            self.type_visitor()
-                .get_field_type(target_def, target_args, i)
-                == source_element_type
-        }) {
+        let target_length = target_def
+            .non_enum_variant()
+            .fields
+            .iter()
+            .enumerate()
+            .try_fold(0_usize, |count, (i, _)| {
+                let field_type = self
+                    .type_visitor()
+                    .get_field_type(target_def, target_args, i);
+                self.homogeneous_element_count(field_type, source_element_type)
+                    .and_then(|field_count| count.checked_add(field_count))
+            });
+        let Some(target_length) = target_length else {
+            return false;
+        };
+        if source_length.is_some_and(|length| length != target_length) {
             return false;
         }
         let source_type = Ty::new_array(self.tcx, source_element_type, target_length as u64);
@@ -2076,8 +2087,57 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         if !layouts_match {
             return false;
         }
-        self.copy_and_transmute(source_path, source_type, target_path, target_type);
+        let mut source_fields = Vec::with_capacity(target_length);
+        for i in 0..target_length {
+            let element_path = Path::new_index(source_path.clone(), Rc::new((i as u128).into()));
+            self.add_nested_leaf_fields_for(element_path, source_element_type, &mut source_fields);
+        }
+        let mut target_fields = Vec::with_capacity(target_length);
+        for (i, _) in target_def.non_enum_variant().fields.iter().enumerate() {
+            let field_path = Path::new_field(target_path.clone(), i);
+            let field_type = self
+                .type_visitor()
+                .get_field_type(target_def, target_args, i);
+            self.add_nested_leaf_fields_for(field_path, field_type, &mut target_fields);
+        }
+        self.copy_field_bits(source_fields, target_fields);
         true
+    }
+
+    fn add_nested_leaf_fields_for(
+        &self,
+        path: Rc<Path>,
+        ty: Ty<'tcx>,
+        accumulator: &mut Vec<(Rc<Path>, Ty<'tcx>)>,
+    ) {
+        match ty.kind() {
+            TyKind::Adt(def, args) => {
+                self.add_leaf_fields_for(path, def, args, self.tcx, accumulator)
+            }
+            TyKind::Array(element_type, length) => {
+                let length = self.get_array_length(length);
+                for i in 0..length {
+                    let element_path = Path::new_index(path.clone(), Rc::new((i as u128).into()));
+                    self.add_nested_leaf_fields_for(element_path, *element_type, accumulator);
+                }
+            }
+            _ => accumulator.push((path, ty)),
+        }
+    }
+
+    fn homogeneous_element_count(
+        &self,
+        candidate_type: Ty<'tcx>,
+        element_type: Ty<'tcx>,
+    ) -> Option<usize> {
+        if candidate_type == element_type {
+            return Some(1);
+        }
+        let TyKind::Array(nested_type, length) = candidate_type.kind() else {
+            return None;
+        };
+        let nested_count = self.homogeneous_element_count(*nested_type, element_type)?;
+        nested_count.checked_mul(self.get_array_length(length))
     }
 
     /// Assign abstract values to the target fields that are consistent with the concrete values

@@ -2214,17 +2214,11 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                             if let TyKind::Array(element_type, length) = storage_type.kind() {
                                 let storage_length = self.bv.get_array_length(length);
                                 for reinterpret_type in [*target, pointee] {
-                                    if reinterpret_type
-                                        .ty_adt_def()
-                                        .is_some_and(|def| {
-                                            def.is_struct()
-                                                && def.non_enum_variant().fields.len()
-                                                    == storage_length
-                                        })
-                                        && self.bv.copy_array_elements_to_struct_layout(
+                                    if self.bv.copy_array_elements_to_struct_layout(
                                             pointee_path.clone(),
                                             pointee_path.clone(),
                                             *element_type,
+                                            Some(storage_length),
                                             reinterpret_type,
                                         )
                                     {
@@ -2270,6 +2264,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                                 source_path.clone(),
                                 target_path,
                                 *element_type,
+                                None,
                                 *target,
                             );
                         }

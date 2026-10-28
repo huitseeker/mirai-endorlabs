@@ -1890,10 +1890,19 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             TyKind::Array(ty, length) => {
                 let length = self.get_array_length(length);
                 for i in 0..length {
-                    source_fields.push((
-                        Path::new_index(source_path.clone(), Rc::new((i as u128).into())),
-                        *ty,
-                    ));
+                    let element_path =
+                        Path::new_index(source_path.clone(), Rc::new((i as u128).into()));
+                    if let TyKind::Adt(def, args) = ty.kind() {
+                        self.add_leaf_fields_for(
+                            element_path,
+                            def,
+                            args,
+                            self.tcx,
+                            &mut source_fields,
+                        );
+                    } else {
+                        source_fields.push((element_path, *ty));
+                    }
                 }
             }
             TyKind::Ref(region, mut ty, mutbl) if type_visitor::is_transparent_wrapper(ty) => {
@@ -1958,10 +1967,19 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 self.current_environment
                     .strong_update_value_at(Path::new_length(target_path.clone()), len_val);
                 for i in 0..length {
-                    target_fields.push((
-                        Path::new_index(target_path.clone(), Rc::new((i as u128).into())),
-                        *ty,
-                    ));
+                    let element_path =
+                        Path::new_index(target_path.clone(), Rc::new((i as u128).into()));
+                    if let TyKind::Adt(def, args) = ty.kind() {
+                        self.add_leaf_fields_for(
+                            element_path,
+                            def,
+                            args,
+                            self.tcx,
+                            &mut target_fields,
+                        );
+                    } else {
+                        target_fields.push((element_path, *ty));
+                    }
                 }
             }
             TyKind::Ref(region, mut ty, mutbl) if type_visitor::is_transparent_wrapper(ty) => {
@@ -2020,6 +2038,46 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             }
         }
         self.copy_field_bits(source_fields, target_fields);
+    }
+
+    /// Copies the elements at `source_path` into an alternate homogeneous `repr(C)` struct
+    /// layout rooted at the same storage. Returns false when the layouts are not equivalent.
+    pub fn copy_array_elements_to_struct_layout(
+        &mut self,
+        source_path: Rc<Path>,
+        target_path: Rc<Path>,
+        source_element_type: Ty<'tcx>,
+        target_type: Ty<'tcx>,
+    ) -> bool {
+        let TyKind::Adt(target_def, target_args) = target_type.kind() else {
+            return false;
+        };
+        if !target_def.is_struct() || !target_def.repr().c() {
+            return false;
+        }
+        let target_length = target_def.non_enum_variant().fields.len();
+        if !(0..target_length).all(|i| {
+            self.type_visitor()
+                .get_field_type(target_def, target_args, i)
+                == source_element_type
+        }) {
+            return false;
+        }
+        let source_type = Ty::new_array(self.tcx, source_element_type, target_length as u64);
+        let layouts_match = self
+            .type_visitor()
+            .layout_of(source_type)
+            .ok()
+            .zip(self.type_visitor().layout_of(target_type).ok())
+            .is_some_and(|(source_layout, target_layout)| {
+                source_layout.size == target_layout.size
+                    && source_layout.align.abi == target_layout.align.abi
+            });
+        if !layouts_match {
+            return false;
+        }
+        self.copy_and_transmute(source_path, source_type, target_path, target_type);
+        true
     }
 
     /// Assign abstract values to the target fields that are consistent with the concrete values

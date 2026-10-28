@@ -2207,6 +2207,31 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         }
                         if pointee == *target {
                             source_value = AbstractValue::make_reference(field_path.canonicalize(&self.bv.current_environment));
+                        } else {
+                            let storage_type = self
+                                .type_visitor()
+                                .get_path_rustc_type(pointee_path, self.bv.current_span);
+                            if let TyKind::Array(element_type, length) = storage_type.kind() {
+                                let storage_length = self.bv.get_array_length(length);
+                                for reinterpret_type in [*target, pointee] {
+                                    if reinterpret_type
+                                        .ty_adt_def()
+                                        .is_some_and(|def| {
+                                            def.is_struct()
+                                                && def.non_enum_variant().fields.len()
+                                                    == storage_length
+                                        })
+                                        && self.bv.copy_array_elements_to_struct_layout(
+                                            pointee_path.clone(),
+                                            pointee_path.clone(),
+                                            *element_type,
+                                            reinterpret_type,
+                                        )
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2232,6 +2257,22 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         .canonicalize(&self.bv.current_environment);
                     if !self.type_visitor().is_slice_pointer(ty.kind()) {
                         source_path = Path::new_field(source_path, 0).canonicalize(&self.bv.current_environment);
+                    }
+                    if let (TyKind::RawPtr(source, _), TyKind::RawPtr(target, _)) =
+                        (source_type.kind(), ty.kind())
+                    {
+                        if let TyKind::Slice(element_type) = source.kind() {
+                            let target_path = Path::new_index(
+                                source_path.clone(),
+                                Rc::new(0_u128.into()),
+                            );
+                            self.bv.copy_array_elements_to_struct_layout(
+                                source_path.clone(),
+                                target_path,
+                                *element_type,
+                                *target,
+                            );
+                        }
                     }
                     if let mir::Operand::Move(..) = operand {
                         self.bv

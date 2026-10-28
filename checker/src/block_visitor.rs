@@ -2227,6 +2227,23 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                                 }
                             }
                         }
+                    } else if let (TyKind::RawPtr(source, _), TyKind::RawPtr(target, _)) =
+                        (source_type.kind(), ty.kind())
+                    {
+                        let source_path = self
+                            .get_operand_path(operand)
+                            .canonicalize(&self.bv.current_environment);
+                        let pointee_path = Path::new_deref(
+                            source_path,
+                            ExpressionType::NonPrimitive,
+                        );
+                        self.bv.copy_array_elements_to_struct_layout(
+                            pointee_path.clone(),
+                            pointee_path,
+                            *source,
+                            None,
+                            *target,
+                        );
                     }
                 }
                 if source_type.is_enum() {
@@ -2257,7 +2274,10 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     {
                         if let TyKind::Slice(element_type) = source.kind() {
                             let target_path = Path::new_index(
-                                source_path.clone(),
+                                Path::new_deref(
+                                    source_path.clone(),
+                                    ExpressionType::NonPrimitive,
+                                ),
                                 Rc::new(0_u128.into()),
                             );
                             self.bv.copy_array_elements_to_struct_layout(

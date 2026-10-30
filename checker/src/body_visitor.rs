@@ -442,9 +442,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 local_val
             }
         };
-        let mut result = if refined_val.is_top()
-            && !matches!(refined_val.expression, Expression::AbstractedValue { .. })
-        {
+        let mut result = if refined_val.is_top() {
             if path.path_length() < k_limits::MAX_PATH_LENGTH {
                 let mut result = None;
                 if let PathEnum::QualifiedPath {

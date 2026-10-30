@@ -52,6 +52,7 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
 
     pub already_reported_errors_for_call_to: HashSet<Rc<AbstractValue>>,
     pub analyzing_static_var: bool,
+    pub array_iterator_loop_lengths: HashMap<mir::BasicBlock, usize>,
     // True if the current function cannot be completely analyzed.
     pub analysis_is_incomplete: bool,
     pub assume_preconditions_of_next_call: bool,
@@ -123,6 +124,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
 
             already_reported_errors_for_call_to: HashSet::new(),
             analyzing_static_var: false,
+            array_iterator_loop_lengths: HashMap::new(),
             analysis_is_incomplete: false,
             assume_preconditions_of_next_call: false,
             async_fn_summary: None,
@@ -1327,10 +1329,12 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                         let t = self
                             .type_visitor
                             .get_path_rustc_type(path, self.current_span);
-                        if t.is_never() {
+                        if t.is_never()
+                            || ExpressionType::from(t.kind()) != ExpressionType::NonPrimitive
+                        {
                             // The right hand value has lost precision in such a way that we cannot
-                            // even get its rustc type. In that case, let's try using the type of
-                            // the left hand value.
+                            // get a rustc type consistent with its abstract value. In that case,
+                            // use the type of the left hand value.
                             let t = self
                                 .type_visitor
                                 .get_path_rustc_type(&tpath, self.current_span);
@@ -1890,10 +1894,19 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             TyKind::Array(ty, length) => {
                 let length = self.get_array_length(length);
                 for i in 0..length {
-                    source_fields.push((
-                        Path::new_index(source_path.clone(), Rc::new((i as u128).into())),
-                        *ty,
-                    ));
+                    let element_path =
+                        Path::new_index(source_path.clone(), Rc::new((i as u128).into()));
+                    if let TyKind::Adt(def, args) = ty.kind() {
+                        self.add_leaf_fields_for(
+                            element_path,
+                            def,
+                            args,
+                            self.tcx,
+                            &mut source_fields,
+                        );
+                    } else {
+                        source_fields.push((element_path, *ty));
+                    }
                 }
             }
             TyKind::Ref(region, mut ty, mutbl) if type_visitor::is_transparent_wrapper(ty) => {
@@ -1958,10 +1971,19 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 self.current_environment
                     .strong_update_value_at(Path::new_length(target_path.clone()), len_val);
                 for i in 0..length {
-                    target_fields.push((
-                        Path::new_index(target_path.clone(), Rc::new((i as u128).into())),
-                        *ty,
-                    ));
+                    let element_path =
+                        Path::new_index(target_path.clone(), Rc::new((i as u128).into()));
+                    if let TyKind::Adt(def, args) = ty.kind() {
+                        self.add_leaf_fields_for(
+                            element_path,
+                            def,
+                            args,
+                            self.tcx,
+                            &mut target_fields,
+                        );
+                    } else {
+                        target_fields.push((element_path, *ty));
+                    }
                 }
             }
             TyKind::Ref(region, mut ty, mutbl) if type_visitor::is_transparent_wrapper(ty) => {
@@ -2020,6 +2042,128 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
             }
         }
         self.copy_field_bits(source_fields, target_fields);
+    }
+
+    /// Copies the elements at `source_path` into an alternate homogeneous `repr(C)` struct
+    /// layout rooted at the same storage. Returns false when the layouts are not equivalent.
+    pub fn copy_array_elements_to_struct_layout(
+        &mut self,
+        source_path: Rc<Path>,
+        target_path: Rc<Path>,
+        source_element_type: Ty<'tcx>,
+        source_length: Option<usize>,
+        target_type: Ty<'tcx>,
+    ) -> bool {
+        let TyKind::Adt(target_def, target_args) = target_type.kind() else {
+            return false;
+        };
+        if !target_def.is_struct() || !target_def.repr().c() {
+            return false;
+        }
+        let target_length = target_def
+            .non_enum_variant()
+            .fields
+            .iter()
+            .enumerate()
+            .try_fold(0_usize, |count, (i, _)| {
+                let field_type = self
+                    .type_visitor()
+                    .get_field_type(target_def, target_args, i);
+                self.homogeneous_element_count(field_type, source_element_type)
+                    .and_then(|field_count| count.checked_add(field_count))
+            });
+        let Some(target_length) = target_length else {
+            return false;
+        };
+        if target_length >= k_limits::MAX_ELEMENTS_TO_TRACK {
+            return false;
+        }
+        if source_length.is_some_and(|length| length != target_length) {
+            return false;
+        }
+        let source_type = Ty::new_array(self.tcx, source_element_type, target_length as u64);
+        let layouts_match = self
+            .type_visitor()
+            .layout_of(source_type)
+            .ok()
+            .zip(self.type_visitor().layout_of(target_type).ok())
+            .is_some_and(|(source_layout, target_layout)| {
+                source_layout.size == target_layout.size
+                    && source_layout.align.abi == target_layout.align.abi
+            });
+        if !layouts_match {
+            return false;
+        }
+        let mut source_fields = Vec::with_capacity(target_length);
+        for i in 0..target_length {
+            let element_path = Path::new_index(source_path.clone(), Rc::new((i as u128).into()));
+            self.add_nested_leaf_fields_for(element_path, source_element_type, &mut source_fields);
+        }
+        let mut target_fields = Vec::with_capacity(target_length);
+        for (i, _) in target_def.non_enum_variant().fields.iter().enumerate() {
+            let field_path = Path::new_field(target_path.clone(), i);
+            let field_type = self
+                .type_visitor()
+                .get_field_type(target_def, target_args, i);
+            self.add_nested_leaf_fields_for(field_path, field_type, &mut target_fields);
+        }
+        self.copy_field_bits(source_fields, target_fields);
+        true
+    }
+
+    fn add_nested_leaf_fields_for(
+        &self,
+        path: Rc<Path>,
+        ty: Ty<'tcx>,
+        accumulator: &mut Vec<(Rc<Path>, Ty<'tcx>)>,
+    ) {
+        match ty.kind() {
+            TyKind::Adt(def, args) if def.is_struct() && def.repr().c() => {
+                for (index, _) in def.non_enum_variant().fields.iter().enumerate() {
+                    let field_path = Path::new_field(path.clone(), index);
+                    let field_type = self.type_visitor().get_field_type(def, args, index);
+                    self.add_nested_leaf_fields_for(field_path, field_type, accumulator);
+                }
+            }
+            TyKind::Adt(def, args) => {
+                self.add_leaf_fields_for(path, def, args, self.tcx, accumulator);
+            }
+            TyKind::Array(element_type, length) => {
+                let length = self.get_array_length(length);
+                for i in 0..length {
+                    let element_path = Path::new_index(path.clone(), Rc::new((i as u128).into()));
+                    self.add_nested_leaf_fields_for(element_path, *element_type, accumulator);
+                }
+            }
+            _ => accumulator.push((path, ty)),
+        }
+    }
+
+    fn homogeneous_element_count(
+        &self,
+        candidate_type: Ty<'tcx>,
+        element_type: Ty<'tcx>,
+    ) -> Option<usize> {
+        if candidate_type == element_type {
+            return Some(1);
+        }
+        match candidate_type.kind() {
+            TyKind::Array(nested_type, length) => {
+                let nested_count = self.homogeneous_element_count(*nested_type, element_type)?;
+                nested_count.checked_mul(self.get_array_length(length))
+            }
+            TyKind::Adt(def, args) if def.is_struct() && def.repr().c() => {
+                def.non_enum_variant().fields.iter().enumerate().try_fold(
+                    0_usize,
+                    |count, (index, _)| {
+                        let field_type = self.type_visitor().get_field_type(def, args, index);
+                        self.homogeneous_element_count(field_type, element_type)
+                            .and_then(|field_count| count.checked_add(field_count))
+                    },
+                )
+            }
+            _ => None,
+        }
     }
 
     /// Assign abstract values to the target fields that are consistent with the concrete values

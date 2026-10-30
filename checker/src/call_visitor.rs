@@ -475,6 +475,25 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     pub fn handled_as_special_function_call(&mut self) -> bool {
         self.unpack_allocator_arguments();
         match self.callee_known_name {
+            KnownNames::StdArrayFromFn => {
+                return self.handle_array_from_fn();
+            }
+            KnownNames::StdOpsIndexIndex => {
+                return self.handle_array_index();
+            }
+            KnownNames::StdArrayMap => {
+                return self.handle_array_map();
+            }
+            KnownNames::StdIterIntoIteratorIntoIter => {
+                if self.handle_array_into_iter() {
+                    return true;
+                }
+            }
+            KnownNames::StdIterIteratorNext => {
+                if self.handle_array_into_iter_next() {
+                    return true;
+                }
+            }
             KnownNames::StdCloneClone => {
                 checked_assume!(self.actual_argument_types.len() == 1);
                 return self.handled_clone();
@@ -664,6 +683,552 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
         }
         false
+    }
+
+    /// Model `array::from_fn` at its call site so that each closure invocation receives a
+    /// concrete index and writes only the corresponding result element.
+    fn handle_array_from_fn(&mut self) -> bool {
+        checked_assume!(self.actual_args.len() == 1);
+        checked_assume!(self.actual_argument_types.len() == 1);
+
+        let result_type = self
+            .type_visitor()
+            .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
+        let TyKind::Array(_, length) = result_type.kind() else {
+            return false;
+        };
+        let length = self.block_visitor.bv.get_array_length(length);
+        if length >= k_limits::MAX_ELEMENTS_TO_TRACK {
+            return false;
+        }
+
+        let closure = self.actual_args[0].clone();
+        let closure_type = self.actual_argument_types[0];
+        let Some(func_ref) = self.block_visitor.get_func_ref(&closure.1) else {
+            return false;
+        };
+        let Some(def_id) = func_ref.def_id else {
+            return false;
+        };
+        let generic_arguments = match closure_type.kind() {
+            TyKind::Closure(_, args) => Some(self.type_visitor().specialize_generic_args(
+                args.as_closure().args,
+                &self.type_visitor().generic_argument_map,
+            )),
+            TyKind::FnDef(_, args) => Some(self.type_visitor().specialize_generic_args(
+                args.skip_binder(),
+                &self.type_visitor().generic_argument_map,
+            )),
+            _ => return false,
+        };
+        let tcx = self.block_visitor.bv.tcx;
+        let closure_argument_type = Ty::new_mut_ref(tcx, tcx.lifetimes.re_static, closure_type);
+        let closure_reference = AbstractValue::make_reference(closure.0.clone());
+        let closure_argument = (
+            Path::get_as_path(closure_reference.clone()),
+            closure_reference,
+        );
+        let actual_argument_types = vec![closure_argument_type, tcx.types.usize];
+        let argument_map = generic_arguments.and_then(|args| {
+            self.type_visitor()
+                .get_generic_arguments_map(def_id, args, &actual_argument_types)
+        });
+        let preflight_index: Rc<AbstractValue> = Rc::new(0_u128.into());
+        let preflight_args = vec![
+            closure_argument.clone(),
+            (Path::new_computed(preflight_index.clone()), preflight_index),
+        ];
+        let function_constant_args = self
+            .block_visitor
+            .get_function_constant_args(&preflight_args, &actual_argument_types);
+        let environment_before_call = self.block_visitor.bv.current_environment.clone();
+        let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
+        let mut preflight_call_visitor = CallVisitor::new(
+            &mut block_visitor,
+            def_id,
+            generic_arguments,
+            argument_map.clone(),
+            environment_before_call,
+            ConstantDomain::Function(func_ref.clone()),
+        );
+        preflight_call_visitor.actual_args = preflight_args;
+        preflight_call_visitor.actual_argument_types = actual_argument_types.clone();
+        preflight_call_visitor.function_constant_args = &function_constant_args;
+        preflight_call_visitor.callee_fun_val = closure.1.clone();
+        let Some(summary) = preflight_call_visitor.get_function_summary() else {
+            return false;
+        };
+        if !summary.is_computed || summary.is_incomplete {
+            return false;
+        }
+
+        let result_path = self.block_visitor.visit_rh_place(&self.destination);
+        self.block_visitor.bv.update_value_at(
+            Path::new_length(result_path.clone()),
+            Rc::new((length as u128).into()),
+        );
+
+        for index in 0..length {
+            let index_value: Rc<AbstractValue> = Rc::new((index as u128).into());
+            let actual_args = vec![
+                closure_argument.clone(),
+                (Path::new_computed(index_value.clone()), index_value.clone()),
+            ];
+            let environment_before_call = self.block_visitor.bv.current_environment.clone();
+            let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
+            let mut closure_call_visitor = CallVisitor::new(
+                &mut block_visitor,
+                def_id,
+                generic_arguments,
+                argument_map.clone(),
+                environment_before_call,
+                ConstantDomain::Function(func_ref.clone()),
+            );
+            closure_call_visitor.actual_args = actual_args;
+            closure_call_visitor.actual_argument_types = actual_argument_types.clone();
+            closure_call_visitor.callee_fun_val = closure.1.clone();
+            closure_call_visitor.target = self.target;
+            let element_path = Path::new_index(result_path.clone(), index_value);
+            closure_call_visitor
+                .check_preconditions_if_necessary_for_result(&summary, &Some(element_path.clone()));
+            if closure_call_visitor.block_visitor.bv.analysis_is_incomplete {
+                return true;
+            }
+            closure_call_visitor
+                .transfer_and_refine_normal_return_state_to_path(&summary, element_path.clone());
+            if closure_call_visitor.block_visitor.bv.analysis_is_incomplete {
+                return true;
+            }
+            closure_call_visitor.add_post_condition_to_exit_conditions_for_result(
+                &summary,
+                &Some(element_path),
+                index > 0,
+            );
+        }
+
+        if length == 0 {
+            self.use_entry_condition_as_exit_condition();
+        }
+        true
+    }
+
+    /// Model constant array ranges at their call site so that the resulting slice points into
+    /// the source array rather than an unrelated abstract allocation.
+    fn handle_array_index(&mut self) -> bool {
+        checked_assume!(self.actual_args.len() == 2);
+        checked_assume!(self.actual_argument_types.len() == 2);
+
+        let TyKind::Ref(_, source_type, _) = self.actual_argument_types[0].kind() else {
+            return false;
+        };
+        let TyKind::Array(_, source_length) = source_type.kind() else {
+            return false;
+        };
+        let source_length = self.block_visitor.bv.get_array_length(source_length) as u128;
+        let TyKind::Adt(range_def, _) = self.actual_argument_types[1].kind() else {
+            return false;
+        };
+        if !matches!(
+            self.block_visitor
+                .bv
+                .tcx
+                .def_path_str(range_def.did())
+                .as_str(),
+            "core::ops::Range" | "std::ops::Range"
+        ) {
+            return false;
+        }
+        let result_type = self
+            .type_visitor()
+            .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
+        let TyKind::Ref(_, result_pointee, _) = result_type.kind() else {
+            return false;
+        };
+        if !matches!(result_pointee.kind(), TyKind::Slice(..)) {
+            return false;
+        }
+
+        let range_path = self.actual_args[1].0.clone();
+        let start = self.block_visitor.bv.lookup_path_and_refine_result(
+            Path::new_field(range_path.clone(), 0),
+            self.block_visitor.bv.tcx.types.usize,
+        );
+        let end = self.block_visitor.bv.lookup_path_and_refine_result(
+            Path::new_field(range_path, 1),
+            self.block_visitor.bv.tcx.types.usize,
+        );
+        let (
+            Expression::CompileTimeConstant(ConstantDomain::U128(start)),
+            Expression::CompileTimeConstant(ConstantDomain::U128(end)),
+        ) = (&start.expression, &end.expression)
+        else {
+            return false;
+        };
+        if start > end || *end > source_length {
+            return false;
+        }
+
+        let source_path = match &self.actual_args[0].1.expression {
+            Expression::Reference(path) => path.clone(),
+            _ => Path::new_deref(self.actual_args[0].0.clone(), ExpressionType::NonPrimitive)
+                .canonicalize(&self.block_visitor.bv.current_environment),
+        };
+        let result_path = self.block_visitor.visit_rh_place(&self.destination);
+        let first_element = Path::new_index(source_path, Rc::new((*start).into()));
+        self.block_visitor.bv.update_value_at(
+            Path::new_field(result_path.clone(), 0),
+            AbstractValue::make_reference(first_element),
+        );
+        self.block_visitor
+            .bv
+            .update_value_at(Path::new_length(result_path), Rc::new((end - start).into()));
+        self.use_entry_condition_as_exit_condition();
+        true
+    }
+
+    /// Model consuming iteration over fixed-size arrays and slices with concrete cursor positions.
+    fn handle_array_into_iter(&mut self) -> bool {
+        checked_assume!(self.actual_args.len() == 1);
+        checked_assume!(self.actual_argument_types.len() == 1);
+
+        let source_type = self.actual_argument_types[0];
+        let (length, slice_source) = match source_type.kind() {
+            TyKind::Array(_, length) => (
+                Rc::new((self.block_visitor.bv.get_array_length(length) as u128).into()),
+                None,
+            ),
+            TyKind::Ref(_, pointee, _) if matches!(pointee.kind(), TyKind::Slice(..)) => {
+                let source_path = match &self.actual_args[0].1.expression {
+                    Expression::Reference(path) => path.clone(),
+                    _ => {
+                        Path::new_deref(self.actual_args[0].0.clone(), ExpressionType::NonPrimitive)
+                            .canonicalize(&self.block_visitor.bv.current_environment)
+                    }
+                };
+                let length = self.block_visitor.bv.lookup_path_and_refine_result(
+                    Path::new_length(source_path.clone()),
+                    self.block_visitor.bv.tcx.types.usize,
+                );
+                (length, Some(source_path))
+            }
+            _ => return false,
+        };
+        if let Expression::CompileTimeConstant(ConstantDomain::U128(length)) = &length.expression {
+            if *length >= k_limits::MAX_ELEMENTS_TO_TRACK as u128 {
+                return false;
+            }
+        }
+
+        let iterator_path = self.block_visitor.visit_rh_place(&self.destination);
+        let data_path = Path::new_model_field(
+            iterator_path.clone(),
+            Rc::from("mirai_array_into_iter_data"),
+        );
+        if let Some(source_path) = slice_source {
+            self.block_visitor
+                .bv
+                .update_value_at(data_path, AbstractValue::make_reference(source_path));
+        } else {
+            self.type_visitor_mut()
+                .set_path_rustc_type(data_path.clone(), source_type);
+            self.block_visitor.bv.copy_or_move_elements(
+                data_path,
+                self.actual_args[0].0.clone(),
+                source_type,
+                false,
+            );
+        }
+        self.block_visitor.bv.update_value_at(
+            Path::new_model_field(
+                iterator_path.clone(),
+                Rc::from("mirai_array_into_iter_cursor"),
+            ),
+            Rc::new(0_u128.into()),
+        );
+        self.block_visitor.bv.update_value_at(
+            Path::new_model_field(iterator_path, Rc::from("mirai_array_into_iter_length")),
+            length,
+        );
+        self.use_entry_condition_as_exit_condition();
+        true
+    }
+
+    /// Return the next element from an iterator modeled by `handle_array_into_iter`.
+    fn handle_array_into_iter_next(&mut self) -> bool {
+        checked_assume!(self.actual_args.len() == 1);
+        checked_assume!(self.actual_argument_types.len() == 1);
+
+        let TyKind::Ref(_, iterator_type, _) = self.actual_argument_types[0].kind() else {
+            return false;
+        };
+        let TyKind::Adt(iterator_def, iterator_args) = iterator_type.kind() else {
+            return false;
+        };
+        let iterator_name = self.block_visitor.bv.tcx.def_path_str(iterator_def.did());
+        let is_array_iterator = iterator_name.ends_with("array::IntoIter")
+            || iterator_name.ends_with("array::iter::IntoIter");
+        let is_slice_iterator =
+            iterator_name.ends_with("slice::Iter") || iterator_name.ends_with("slice::iter::Iter");
+        if !is_array_iterator && !is_slice_iterator {
+            return false;
+        }
+        let Some(element_type) = iterator_args.types().next() else {
+            return false;
+        };
+
+        let iterator_path =
+            Path::new_deref(self.actual_args[0].0.clone(), ExpressionType::NonPrimitive)
+                .canonicalize(&self.block_visitor.bv.current_environment);
+        let cursor_path = Path::new_model_field(
+            iterator_path.clone(),
+            Rc::from("mirai_array_into_iter_cursor"),
+        );
+        let length_path = Path::new_model_field(
+            iterator_path.clone(),
+            Rc::from("mirai_array_into_iter_length"),
+        );
+        let cursor = self.block_visitor.bv.lookup_path_and_refine_result(
+            cursor_path.clone(),
+            self.block_visitor.bv.tcx.types.usize,
+        );
+        let length = self
+            .block_visitor
+            .bv
+            .lookup_path_and_refine_result(length_path, self.block_visitor.bv.tcx.types.usize);
+        let concrete_position = match (&cursor.expression, &length.expression) {
+            (
+                Expression::CompileTimeConstant(ConstantDomain::U128(cursor)),
+                Expression::CompileTimeConstant(ConstantDomain::U128(length)),
+            ) => Some((*cursor, *length)),
+            _ => None,
+        };
+        if let Some((_, length)) = concrete_position {
+            let Ok(loop_length) = usize::try_from(length) else {
+                return false;
+            };
+            self.block_visitor
+                .bv
+                .array_iterator_loop_lengths
+                .insert(self.block_visitor.bv.current_location.block, loop_length);
+        }
+
+        let result_type = self
+            .type_visitor()
+            .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
+        let TyKind::Adt(result_def, _) = result_type.kind() else {
+            return false;
+        };
+        if !result_def.is_enum() || result_def.variants().len() != 2 {
+            return false;
+        }
+        let result_path = self.block_visitor.visit_rh_place(&self.destination);
+        let discriminant_path = Path::new_discriminant(result_path.clone());
+        let discriminant_type = result_type.discriminant_ty(self.block_visitor.bv.tcx);
+        let some_discriminant = self.block_visitor.get_int_const_val(1, discriminant_type);
+        let none_discriminant = self.block_visitor.get_int_const_val(0, discriminant_type);
+
+        let has_next = cursor.less_than(length.clone());
+        if has_next.as_bool_if_known() != Some(false) {
+            let discriminant = has_next
+                .conditional_expression(some_discriminant.clone(), none_discriminant.clone());
+            self.block_visitor
+                .bv
+                .update_value_at(discriminant_path, discriminant);
+            let data_path =
+                Path::new_model_field(iterator_path, Rc::from("mirai_array_into_iter_data"));
+            let index = cursor.clone();
+            let value = if is_slice_iterator {
+                let source = self.block_visitor.bv.lookup_path_and_refine_result(
+                    data_path.clone(),
+                    self.block_visitor.bv.tcx.types.usize,
+                );
+                let source_path = match &source.expression {
+                    Expression::Reference(path)
+                    | Expression::InitialParameterValue { path, .. }
+                    | Expression::Variable { path, .. } => path,
+                    _ => return false,
+                };
+                AbstractValue::make_reference(Path::new_index(source_path.clone(), index))
+            } else {
+                let source_path = Path::new_index(data_path, index);
+                self.block_visitor
+                    .bv
+                    .lookup_path_and_refine_result(source_path, element_type)
+            };
+            let payload_path = Path::new_field(
+                Path::new_qualified(
+                    result_path,
+                    Rc::new(PathSelector::Downcast(
+                        Rc::from("Some"),
+                        1,
+                        some_discriminant,
+                    )),
+                ),
+                0,
+            );
+            self.block_visitor.bv.update_value_at(payload_path, value);
+            let next_cursor = cursor.addition(Rc::new(1_u128.into()));
+            self.block_visitor.bv.update_value_at(
+                cursor_path.clone(),
+                has_next.conditional_expression(next_cursor, cursor),
+            );
+        } else {
+            self.block_visitor
+                .bv
+                .update_value_at(discriminant_path, none_discriminant);
+        }
+        self.use_entry_condition_as_exit_condition();
+        true
+    }
+
+    /// Model `array::map` at its call site so that each closure invocation receives one
+    /// concrete source element and writes only the corresponding result element.
+    fn handle_array_map(&mut self) -> bool {
+        checked_assume!(self.actual_args.len() == 2);
+        checked_assume!(self.actual_argument_types.len() == 2);
+
+        let source_type = self.actual_argument_types[0];
+        let TyKind::Array(element_type, source_length) = source_type.kind() else {
+            return false;
+        };
+        let source_length = self.block_visitor.bv.get_array_length(source_length);
+        let result_type = self
+            .type_visitor()
+            .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
+        let TyKind::Array(_, result_length) = result_type.kind() else {
+            return false;
+        };
+        let result_length = self.block_visitor.bv.get_array_length(result_length);
+        if source_length != result_length || result_length >= k_limits::MAX_ELEMENTS_TO_TRACK {
+            return false;
+        }
+
+        if result_length == 0 {
+            let result_path = self.block_visitor.visit_rh_place(&self.destination);
+            self.block_visitor
+                .bv
+                .update_value_at(Path::new_length(result_path), Rc::new(0_u128.into()));
+            self.use_entry_condition_as_exit_condition();
+            return true;
+        }
+
+        let source_path = self.actual_args[0].0.clone();
+        let closure = self.actual_args[1].clone();
+        let closure_type = self.actual_argument_types[1];
+        let Some(func_ref) = self.block_visitor.get_func_ref(&closure.1) else {
+            return false;
+        };
+        let Some(def_id) = func_ref.def_id else {
+            return false;
+        };
+        let generic_arguments = match closure_type.kind() {
+            TyKind::Closure(_, args) => Some(self.type_visitor().specialize_generic_args(
+                args.as_closure().args,
+                &self.type_visitor().generic_argument_map,
+            )),
+            TyKind::FnDef(_, args) => Some(self.type_visitor().specialize_generic_args(
+                args.skip_binder(),
+                &self.type_visitor().generic_argument_map,
+            )),
+            _ => return false,
+        };
+        let tcx = self.block_visitor.bv.tcx;
+        let closure_argument_type = Ty::new_mut_ref(tcx, tcx.lifetimes.re_static, closure_type);
+        let closure_reference = AbstractValue::make_reference(closure.0.clone());
+        let closure_argument = (
+            Path::get_as_path(closure_reference.clone()),
+            closure_reference,
+        );
+        let actual_argument_types = vec![closure_argument_type, *element_type];
+        let argument_map = generic_arguments.and_then(|args| {
+            self.type_visitor()
+                .get_generic_arguments_map(def_id, args, &actual_argument_types)
+        });
+
+        let first_index: Rc<AbstractValue> = Rc::new(0_u128.into());
+        let first_element_path = Path::new_index(source_path.clone(), first_index);
+        let first_element = self
+            .block_visitor
+            .bv
+            .lookup_path_and_refine_result(first_element_path.clone(), *element_type);
+        let preflight_args = vec![
+            closure_argument.clone(),
+            (first_element_path, first_element),
+        ];
+        let function_constant_args = self
+            .block_visitor
+            .get_function_constant_args(&preflight_args, &actual_argument_types);
+        let environment_before_call = self.block_visitor.bv.current_environment.clone();
+        let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
+        let mut preflight_call_visitor = CallVisitor::new(
+            &mut block_visitor,
+            def_id,
+            generic_arguments,
+            argument_map.clone(),
+            environment_before_call,
+            ConstantDomain::Function(func_ref.clone()),
+        );
+        preflight_call_visitor.actual_args = preflight_args;
+        preflight_call_visitor.actual_argument_types = actual_argument_types.clone();
+        preflight_call_visitor.function_constant_args = &function_constant_args;
+        preflight_call_visitor.callee_fun_val = closure.1.clone();
+        let Some(summary) = preflight_call_visitor.get_function_summary() else {
+            return false;
+        };
+        if !summary.is_computed || summary.is_incomplete {
+            return false;
+        }
+
+        let result_path = self.block_visitor.visit_rh_place(&self.destination);
+        self.block_visitor.bv.update_value_at(
+            Path::new_length(result_path.clone()),
+            Rc::new((result_length as u128).into()),
+        );
+        for index in 0..result_length {
+            let index_value: Rc<AbstractValue> = Rc::new((index as u128).into());
+            let element_path = Path::new_index(source_path.clone(), index_value.clone());
+            let element_value = self
+                .block_visitor
+                .bv
+                .lookup_path_and_refine_result(element_path.clone(), *element_type);
+            let actual_args = vec![closure_argument.clone(), (element_path, element_value)];
+            let environment_before_call = self.block_visitor.bv.current_environment.clone();
+            let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
+            let mut closure_call_visitor = CallVisitor::new(
+                &mut block_visitor,
+                def_id,
+                generic_arguments,
+                argument_map.clone(),
+                environment_before_call,
+                ConstantDomain::Function(func_ref.clone()),
+            );
+            closure_call_visitor.actual_args = actual_args;
+            closure_call_visitor.actual_argument_types = actual_argument_types.clone();
+            closure_call_visitor.callee_fun_val = closure.1.clone();
+            closure_call_visitor.target = self.target;
+            let result_element_path = Path::new_index(result_path.clone(), index_value);
+            closure_call_visitor.check_preconditions_if_necessary_for_result(
+                &summary,
+                &Some(result_element_path.clone()),
+            );
+            if closure_call_visitor.block_visitor.bv.analysis_is_incomplete {
+                return true;
+            }
+            closure_call_visitor.transfer_and_refine_normal_return_state_to_path(
+                &summary,
+                result_element_path.clone(),
+            );
+            if closure_call_visitor.block_visitor.bv.analysis_is_incomplete {
+                return true;
+            }
+            closure_call_visitor.add_post_condition_to_exit_conditions_for_result(
+                &summary,
+                &Some(result_element_path),
+                index > 0,
+            );
+        }
+
+        true
     }
 
     fn unpack_allocator_arguments(&mut self) {
@@ -1792,11 +2357,20 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .bv
                 .extract_tag_field_of_non_scalar_value_at(&source_path, source_rustc_type)
         } else {
+            let abstracted_value = self
+                .block_visitor
+                .bv
+                .current_environment
+                .value_at(&source_path)
+                .filter(|value| matches!(value.expression, Expression::AbstractedValue { .. }))
+                .cloned();
             (
                 source_path.clone(),
-                self.block_visitor
-                    .bv
-                    .lookup_path_and_refine_result(source_path, source_rustc_type),
+                abstracted_value.unwrap_or_else(|| {
+                    self.block_visitor
+                        .bv
+                        .lookup_path_and_refine_result(source_path, source_rustc_type)
+                }),
             )
         }
     }
@@ -2756,6 +3330,15 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     /// then check the preconditions and report any conditions that are not known to hold at this point.
     #[logfn_inputs(TRACE)]
     pub fn check_preconditions_if_necessary(&mut self, function_summary: &Summary) {
+        let result = Some(self.block_visitor.visit_rh_place(&self.destination));
+        self.check_preconditions_if_necessary_for_result(function_summary, &result);
+    }
+
+    fn check_preconditions_if_necessary_for_result(
+        &mut self,
+        function_summary: &Summary,
+        result: &Option<Rc<Path>>,
+    ) {
         if self.block_visitor.bv.check_for_errors
             && self
                 .block_visitor
@@ -2771,7 +3354,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 .already_reported_errors_for_call_to
                 .contains(&self.callee_fun_val)
         {
-            self.check_function_preconditions(function_summary);
+            self.check_function_preconditions(function_summary, result);
         } else {
             if let Some(fr) = &self.callee_func_ref {
                 if fr.summary_cache_key.ends_with(".deref") {
@@ -2788,15 +3371,18 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     /// Preconditions that are maybe false become preconditions of the calling function
     /// unless the calling function is an analysis root, in which case a diagnostic message is issued.
     #[logfn_inputs(TRACE)]
-    fn check_function_preconditions(&mut self, function_summary: &Summary) {
+    fn check_function_preconditions(
+        &mut self,
+        function_summary: &Summary,
+        result: &Option<Rc<Path>>,
+    ) {
         verify!(self.block_visitor.bv.check_for_errors);
         // A precondition can refer to the result if the precondition prevents the result expression
         // from overflowing.
-        let result = Some(self.block_visitor.visit_rh_place(&self.destination));
         for precondition in &function_summary.preconditions {
             let mut refined_condition = precondition.condition.refine_parameters_and_paths(
                 &self.actual_args,
-                &result,
+                result,
                 &self.environment_before_call,
                 &self.block_visitor.bv.current_environment,
                 self.block_visitor.bv.fresh_variable_offset,
@@ -3038,6 +3624,14 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     pub fn transfer_and_refine_normal_return_state(&mut self, function_summary: &Summary) {
         // Assign function result to place
         let target_path = self.block_visitor.visit_rh_place(&self.destination);
+        self.transfer_and_refine_normal_return_state_to_path(function_summary, target_path);
+    }
+
+    fn transfer_and_refine_normal_return_state_to_path(
+        &mut self,
+        function_summary: &Summary,
+        target_path: Rc<Path>,
+    ) {
         let result_path = &Some(target_path.clone());
         // If the summary has a concrete type for the return result, use that type rather
         // than the possibly abstract type of the target path.
@@ -3139,14 +3733,63 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     #[logfn_inputs(TRACE)]
     pub fn add_post_condition_to_exit_conditions(&mut self, function_summary: &Summary) {
         if let Some(target) = &self.target {
-            let target_path = self.block_visitor.visit_lh_place(&self.destination);
-            let result_path = &Some(target_path);
             let mut exit_condition = self
                 .block_visitor
                 .bv
                 .current_environment
                 .entry_condition
                 .clone();
+            if exit_condition.as_bool_if_known().unwrap_or(true) {
+                if let Some(post_condition) = &function_summary.post_condition {
+                    let target_path = self.block_visitor.visit_lh_place(&self.destination);
+                    let refined_post_condition = post_condition.refine_parameters_and_paths(
+                        &self.actual_args,
+                        &Some(target_path),
+                        &self.environment_before_call,
+                        &self.block_visitor.bv.current_environment,
+                        self.block_visitor.bv.fresh_variable_offset,
+                    );
+                    trace!("refined post condition {:?}", refined_post_condition);
+                    exit_condition = exit_condition.and(refined_post_condition);
+                    trace!("post exit conditions {:?}", exit_condition);
+                }
+            }
+            self.block_visitor
+                .bv
+                .current_environment
+                .exit_conditions
+                .insert_mut(*target, exit_condition);
+        }
+    }
+
+    fn add_post_condition_to_exit_conditions_for_result(
+        &mut self,
+        function_summary: &Summary,
+        result_path: &Option<Rc<Path>>,
+        accumulate: bool,
+    ) {
+        if let Some(target) = &self.target {
+            let mut exit_condition = if accumulate {
+                self.block_visitor
+                    .bv
+                    .current_environment
+                    .exit_conditions
+                    .get(target)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.block_visitor
+                            .bv
+                            .current_environment
+                            .entry_condition
+                            .clone()
+                    })
+            } else {
+                self.block_visitor
+                    .bv
+                    .current_environment
+                    .entry_condition
+                    .clone()
+            };
             if exit_condition.as_bool_if_known().unwrap_or(true) {
                 if let Some(post_condition) = &function_summary.post_condition {
                     let refined_post_condition = post_condition.refine_parameters_and_paths(

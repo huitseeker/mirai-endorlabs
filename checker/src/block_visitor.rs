@@ -471,6 +471,26 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         // meaning.
         _replace: bool,
     ) {
+        if self
+            .bv
+            .current_environment
+            .entry_condition
+            .as_bool_if_known()
+            == Some(false)
+        {
+            self.bv
+                .current_environment
+                .exit_conditions
+                .insert_mut(target, self.bv.current_environment.entry_condition.clone());
+            if let mir::UnwindAction::Cleanup(unwind_target) = unwind {
+                self.bv.current_environment.exit_conditions.insert_mut(
+                    unwind_target,
+                    self.bv.current_environment.entry_condition.clone(),
+                );
+            }
+            return;
+        }
+
         let tcx = self.bv.cv.tcx;
         let place_path = self.get_path_for_place(place);
         let path = place_path.canonicalize(&self.bv.current_environment);
@@ -2207,7 +2227,43 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         }
                         if pointee == *target {
                             source_value = AbstractValue::make_reference(field_path.canonicalize(&self.bv.current_environment));
+                        } else {
+                            let storage_type = self
+                                .type_visitor()
+                                .get_path_rustc_type(pointee_path, self.bv.current_span);
+                            if let TyKind::Array(element_type, length) = storage_type.kind() {
+                                let storage_length = self.bv.get_array_length(length);
+                                for reinterpret_type in [*target, pointee] {
+                                    if self.bv.copy_array_elements_to_struct_layout(
+                                            pointee_path.clone(),
+                                            pointee_path.clone(),
+                                            *element_type,
+                                            Some(storage_length),
+                                            reinterpret_type,
+                                        )
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
                         }
+                    } else if let (TyKind::RawPtr(source, _), TyKind::RawPtr(target, _)) =
+                        (source_type.kind(), ty.kind())
+                    {
+                        let source_path = self
+                            .get_operand_path(operand)
+                            .canonicalize(&self.bv.current_environment);
+                        let pointee_path = Path::new_deref(
+                            source_path,
+                            ExpressionType::NonPrimitive,
+                        );
+                        self.bv.copy_array_elements_to_struct_layout(
+                            pointee_path.clone(),
+                            pointee_path,
+                            *source,
+                            None,
+                            *target,
+                        );
                     }
                 }
                 if source_type.is_enum() {
@@ -2232,6 +2288,27 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         .canonicalize(&self.bv.current_environment);
                     if !self.type_visitor().is_slice_pointer(ty.kind()) {
                         source_path = Path::new_field(source_path, 0).canonicalize(&self.bv.current_environment);
+                    }
+                    if let (TyKind::RawPtr(source, _), TyKind::RawPtr(target, _)) =
+                        (source_type.kind(), ty.kind())
+                    {
+                        if let TyKind::Slice(element_type) = source.kind() {
+                            let source_elements = Path::new_deref(
+                                source_path.clone(),
+                                ExpressionType::NonPrimitive,
+                            );
+                            let target_path = Path::new_index(
+                                source_elements.clone(),
+                                Rc::new(0_u128.into()),
+                            );
+                            self.bv.copy_array_elements_to_struct_layout(
+                                source_elements,
+                                target_path,
+                                *element_type,
+                                None,
+                                *target,
+                            );
+                        }
                     }
                     if let mir::Operand::Move(..) = operand {
                         self.bv
@@ -2279,7 +2356,12 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             let length_value = self.visit_const(len);
             self.bv.update_value_at(length_path, length_value);
         } else {
-            assume_unreachable!("non array thin pointer type {:?}", source_type);
+            // Some pointer coercions expose only the element pointer here. The metadata may be
+            // written separately, so retain a sound unknown length instead of rejecting the cast.
+            let length_path = target_path.add_or_replace_selector(Rc::new(PathSelector::Field(1)));
+            let length_value =
+                AbstractValue::make_typed_unknown(ExpressionType::Usize, length_path.clone());
+            self.bv.update_value_at(length_path, length_value);
         }
     }
 

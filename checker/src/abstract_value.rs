@@ -22,7 +22,7 @@ use crate::bool_domain::BoolDomain;
 use crate::constant_domain::ConstantDomain;
 use crate::environment::Environment;
 use crate::expression::Expression::{ConditionalExpression, Join};
-use crate::expression::{Expression, ExpressionType};
+use crate::expression::{Expression, ExpressionType, TagProvenance};
 use crate::interval_domain::{self, IntervalDomain};
 use crate::k_limits;
 use crate::known_names::KnownNames;
@@ -179,6 +179,61 @@ impl From<u128> for AbstractValue {
 }
 
 impl AbstractValue {
+    fn make_abstracted_value(
+        tag_provenance: Rc<AbstractValue>,
+        var_type: ExpressionType,
+    ) -> Rc<AbstractValue> {
+        Rc::new(make_value(Expression::AbstractedValue {
+            tag_provenance: TagProvenance(tag_provenance),
+            var_type,
+        }))
+    }
+
+    /// Extends the symbolic tag provenance of a numerically abstracted binary operand.
+    /// Returns `None` when neither operand has been abstracted.
+    fn extend_abstracted_binary_provenance<F>(
+        left: Rc<AbstractValue>,
+        right: Rc<AbstractValue>,
+        result_type: Option<ExpressionType>,
+        operation: F,
+    ) -> Option<Rc<AbstractValue>>
+    where
+        F: FnOnce(Rc<AbstractValue>, Rc<AbstractValue>) -> Expression,
+    {
+        let (left_provenance, left_abstracted_value) = match &left.expression {
+            Expression::AbstractedValue { tag_provenance, .. } => {
+                (tag_provenance.0.clone(), Some(left.clone()))
+            }
+            _ => (left.clone(), None),
+        };
+        let (right_provenance, right_abstracted_value) = match &right.expression {
+            Expression::AbstractedValue { tag_provenance, .. } => {
+                (tag_provenance.0.clone(), Some(right.clone()))
+            }
+            _ => (right.clone(), None),
+        };
+        let abstracted_value = left_abstracted_value.or(right_abstracted_value)?;
+
+        let expression_size = left_provenance
+            .expression_size
+            .saturating_add(right_provenance.expression_size);
+        let provenance_expression = operation(left_provenance, right_provenance);
+        let var_type = result_type.unwrap_or_else(|| provenance_expression.infer_type());
+        let tag_provenance = Rc::new(AbstractValue {
+            expression_size,
+            ..make_value(provenance_expression)
+        });
+        Some(Rc::new(AbstractValue {
+            expression: Expression::AbstractedValue {
+                tag_provenance: TagProvenance(tag_provenance),
+                var_type,
+            },
+            expression_size: 1,
+            tags: RefCell::new(None),
+            ..abstracted_value.as_ref().clone()
+        }))
+    }
+
     /// Creates an abstract value from a binary expression and keeps track of the size.
     #[logfn_inputs(TRACE)]
     fn make_binary(
@@ -186,10 +241,21 @@ impl AbstractValue {
         mut right: Rc<AbstractValue>,
         operation: fn(Rc<AbstractValue>, Rc<AbstractValue>) -> Expression,
     ) -> Rc<AbstractValue> {
-        if left.is_top() || left.is_bottom() {
+        if left.is_bottom() {
             return left;
         }
-        if right.is_top() || right.is_bottom() {
+        if right.is_bottom() {
+            return right;
+        }
+        if let Some(value) =
+            Self::extend_abstracted_binary_provenance(left.clone(), right.clone(), None, operation)
+        {
+            return value;
+        }
+        if left.is_top() {
+            return left;
+        }
+        if right.is_top() {
             return right;
         }
         let mut expression_size = left.expression_size.saturating_add(right.expression_size);
@@ -217,10 +283,25 @@ impl AbstractValue {
         result_type: ExpressionType,
         operation: fn(Rc<AbstractValue>, Rc<AbstractValue>, ExpressionType) -> Expression,
     ) -> Rc<AbstractValue> {
-        if left.is_top() || left.is_bottom() {
+        if left.is_bottom() {
             return left;
         }
-        if right.is_top() || right.is_bottom() {
+        if right.is_bottom() {
+            return right;
+        }
+        let untyped_operation = |left, right| operation(left, right, result_type);
+        if let Some(value) = Self::extend_abstracted_binary_provenance(
+            left.clone(),
+            right.clone(),
+            Some(result_type),
+            untyped_operation,
+        ) {
+            return value;
+        }
+        if left.is_top() {
+            return left;
+        }
+        if right.is_top() {
             return right;
         }
         let mut expression_size = left.expression_size.saturating_add(right.expression_size);
@@ -365,18 +446,25 @@ impl AbstractValue {
                 consequent,
                 alternate,
             } => {
-                return condition
-                    .make_presence_check(tag)
-                    .or(condition.conditional_expression(
-                        consequent.make_presence_check(tag),
-                        alternate.make_presence_check(tag),
-                    ));
+                let condition_tags = condition.make_presence_check(tag);
+                let consequent_tags = consequent.make_presence_check(tag);
+                let alternate_tags = alternate.make_presence_check(tag);
+                return if tag.is_propagated_by(TagPropagation::ControlFlow) {
+                    condition_tags.or(consequent_tags.or(alternate_tags))
+                } else {
+                    condition_tags
+                        .or(condition.conditional_expression(consequent_tags, alternate_tags))
+                };
             }
 
             Expression::Join { left, right } => {
-                return left
-                    .make_presence_check(tag)
-                    .join(right.make_presence_check(tag));
+                let left = left.make_presence_check(tag);
+                let right = right.make_presence_check(tag);
+                return if tag.is_propagated_by(TagPropagation::ControlFlow) {
+                    left.or(right)
+                } else {
+                    left.join(right)
+                };
             }
 
             Expression::Switch {
@@ -402,6 +490,20 @@ impl AbstractValue {
             }
 
             Expression::WidenedJoin { operand, .. } => return operand.make_presence_check(tag),
+
+            Expression::AbstractedValue { tag_provenance, .. } => {
+                return tag_provenance.0.make_presence_check(tag);
+            }
+
+            Expression::TagPropagationUnion { left, right } => {
+                let left = left.make_presence_check(tag);
+                let right = right.make_presence_check(tag);
+                return if tag.is_propagated_by(TagPropagation::ControlFlow) {
+                    left.or(right)
+                } else {
+                    left.join(right)
+                };
+            }
 
             _ => {
                 checked_assume!(exp_tag_prop_opt.is_some());
@@ -533,18 +635,25 @@ impl AbstractValue {
                 consequent,
                 alternate,
             } => {
-                return condition
-                    .make_absence_check(tag)
-                    .and(condition.conditional_expression(
-                        consequent.make_absence_check(tag),
-                        alternate.make_absence_check(tag),
-                    ));
+                let condition_tags = condition.make_absence_check(tag);
+                let consequent_tags = consequent.make_absence_check(tag);
+                let alternate_tags = alternate.make_absence_check(tag);
+                return if tag.is_propagated_by(TagPropagation::ControlFlow) {
+                    condition_tags.and(consequent_tags.and(alternate_tags))
+                } else {
+                    condition_tags
+                        .and(condition.conditional_expression(consequent_tags, alternate_tags))
+                };
             }
 
             Expression::Join { left, right } => {
-                return left
-                    .make_absence_check(tag)
-                    .join(right.make_absence_check(tag));
+                let left = left.make_absence_check(tag);
+                let right = right.make_absence_check(tag);
+                return if tag.is_propagated_by(TagPropagation::ControlFlow) {
+                    left.and(right)
+                } else {
+                    left.join(right)
+                };
             }
 
             Expression::Switch {
@@ -570,6 +679,20 @@ impl AbstractValue {
             }
 
             Expression::WidenedJoin { operand, .. } => return operand.make_absence_check(tag),
+
+            Expression::AbstractedValue { tag_provenance, .. } => {
+                return tag_provenance.0.make_absence_check(tag);
+            }
+
+            Expression::TagPropagationUnion { left, right } => {
+                let left = left.make_absence_check(tag);
+                let right = right.make_absence_check(tag);
+                return if tag.is_propagated_by(TagPropagation::ControlFlow) {
+                    left.and(right)
+                } else {
+                    left.join(right)
+                };
+            }
 
             _ => {
                 checked_assume!(exp_tag_prop_opt.is_some());
@@ -682,8 +805,8 @@ impl AbstractValue {
             let interval = val.get_cached_interval();
             let tags = val.get_cached_tags();
             Rc::new(AbstractValue {
-                expression: Expression::Variable {
-                    path: Path::new_computed(TOP.into()),
+                expression: Expression::AbstractedValue {
+                    tag_provenance: TagProvenance(val.clone()),
                     var_type,
                 },
                 expression_size: 1,
@@ -3507,6 +3630,7 @@ impl AbstractValueTrait for Rc<AbstractValue> {
         match &self.expression {
             Expression::Top => true,
             Expression::Variable { path, .. } => path.is_top(),
+            Expression::AbstractedValue { .. } => true,
             _ => false,
         }
     }
@@ -3537,17 +3661,27 @@ impl AbstractValueTrait for Rc<AbstractValue> {
         if self.is_bottom() {
             return other;
         }
-        // [TOP join y] -> TOP
-        if self.is_top() {
-            return self.clone();
-        }
-        // [x join {}] -> x
         if other.is_bottom() {
             return self.clone();
+        }
+        if Rc::ptr_eq(self, &other) {
+            return other;
+        }
+        if let Some(value) = AbstractValue::extend_abstracted_binary_provenance(
+            self.clone(),
+            other.clone(),
+            None,
+            |left, right| Expression::TagPropagationUnion { left, right },
+        ) {
+            return value;
         }
         // [x join x] -> x
         if self.eq(&other) {
             return other;
+        }
+        // [TOP join y] -> TOP
+        if self.is_top() {
+            return self.clone();
         }
         // [x join TOP] -> TOP
         if other.is_top() {
@@ -4896,6 +5030,18 @@ impl AbstractValueTrait for Rc<AbstractValue> {
     /// Returns an element that is "self % other".
     #[logfn_inputs(TRACE)]
     fn remainder(&self, other: Rc<AbstractValue>) -> Rc<AbstractValue> {
+        // x % 1 is always zero. In particular, this lets pointer alignment checks for
+        // byte-aligned types take their aligned branch without knowing the pointer value.
+        let result_type = self.expression.infer_type();
+        if result_type.is_integer() && other.is_one() {
+            let zero = if result_type.is_signed_integer() {
+                ConstantDomain::I128(0)
+            } else {
+                ConstantDomain::U128(0)
+            };
+            return Rc::new(zero.into());
+        }
+
         // [(x % y) % y] -> x % y
         if let Expression::Rem { left: x, right: y } = &self.expression {
             if y.eq(&other) {
@@ -5706,6 +5852,7 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 }),
             Expression::TaggedExpression { operand, .. } => operand.get_as_interval(),
             Expression::Variable { var_type, .. } => IntervalDomain::from(*var_type),
+            Expression::AbstractedValue { var_type, .. } => IntervalDomain::from(*var_type),
             Expression::WidenedJoin { operand, .. } => {
                 let interval = operand.get_as_interval();
                 if interval.is_bottom() {
@@ -5836,15 +5983,14 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 // (condition has tag A) or ((consequent has tag A) join (alternate has tag A)).
                 return condition.get_cached_tags().or(&consequent
                     .get_cached_tags()
-                    .join(&alternate.get_cached_tags()));
+                    .join_control_flow(&alternate.get_cached_tags()));
             }
 
             Expression::Join { left, right, .. } => {
-                // For each tag A, whether the join expression has tag A or not is
-                // ((left has tag A) join (right has tag A)).
+                // Tags can opt in to may-tag semantics across control-flow alternatives.
                 return left
                     .get_cached_tags()
-                    .join(right.get_cached_tags().as_ref());
+                    .join_control_flow(right.get_cached_tags().as_ref());
             }
 
             Expression::Switch {
@@ -5856,7 +6002,8 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 // (discriminator has tag A) or ((case_0 has tag A) join .. join (case_n has tag A) join (default has tag A)).
                 let mut tags_from_cases = (*default.get_cached_tags()).clone();
                 for case in cases {
-                    tags_from_cases = tags_from_cases.join(case.1.get_cached_tags().as_ref())
+                    tags_from_cases =
+                        tags_from_cases.join_control_flow(case.1.get_cached_tags().as_ref())
                 }
                 return discriminator.get_cached_tags().or(&tags_from_cases);
             }
@@ -5868,6 +6015,16 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::WidenedJoin { operand, .. } => {
                 let tags = operand.get_cached_tags();
                 return (*tags).clone();
+            }
+
+            Expression::AbstractedValue { tag_provenance, .. } => {
+                return (*tag_provenance.0.get_cached_tags()).clone();
+            }
+
+            Expression::TagPropagationUnion { left, right } => {
+                return left
+                    .get_cached_tags()
+                    .join_control_flow(&right.get_cached_tags());
             }
 
             _ => {
@@ -5976,7 +6133,8 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             | Expression::Shr { left, right, .. }
             | Expression::ShrOverflows { left, right, .. }
             | Expression::Sub { left, right }
-            | Expression::SubOverflows { left, right, .. } => left
+            | Expression::SubOverflows { left, right, .. }
+            | Expression::TagPropagationUnion { left, right } => left
                 .get_widened_subexpression(path)
                 .or_else(|| right.get_widened_subexpression(path)),
             Expression::BitNot { operand, .. }
@@ -6047,6 +6205,9 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 } else {
                     None
                 }
+            }
+            Expression::AbstractedValue { tag_provenance, .. } => {
+                tag_provenance.0.get_widened_subexpression(path)
             }
         }
     }
@@ -6511,9 +6672,39 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 if matches!(refined_operand.expression, Expression::Join { .. }) {
                     refined_operand.widen(&refined_path)
                 } else {
-                    AbstractValue::make_typed_unknown(operand.expression.infer_type(), refined_path)
+                    AbstractValue::make_abstracted_value(
+                        refined_operand,
+                        operand.expression.infer_type(),
+                    )
                 }
             }
+            Expression::AbstractedValue {
+                tag_provenance,
+                var_type,
+            } => {
+                let refined_tag_provenance = tag_provenance
+                    .0
+                    .refine_parameters_and_paths(args, result, pre_env, post_env, fresh);
+                Rc::new(AbstractValue {
+                    expression: Expression::AbstractedValue {
+                        tag_provenance: TagProvenance(refined_tag_provenance),
+                        var_type: *var_type,
+                    },
+                    tags: RefCell::new(None),
+                    ..self.as_ref().clone()
+                })
+            }
+            Expression::TagPropagationUnion { left, right } => Rc::new(AbstractValue {
+                expression: Expression::TagPropagationUnion {
+                    left: left.refine_parameters_and_paths(args, result, pre_env, post_env, fresh),
+                    right: right
+                        .refine_parameters_and_paths(args, result, pre_env, post_env, fresh),
+                },
+                expression_size: self.expression_size,
+                interval: RefCell::new(None),
+                is_non_null: RefCell::new(None),
+                tags: RefCell::new(None),
+            }),
         }
     }
 
@@ -6847,6 +7038,7 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::WidenedJoin { path, operand } => {
                 operand.refine_with(path_condition, depth + 1).widen(path)
             }
+            Expression::AbstractedValue { .. } | Expression::TagPropagationUnion { .. } => value,
         }
     }
 
@@ -7113,7 +7305,8 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             | Expression::Shr { left, right, .. }
             | Expression::ShrOverflows { left, right, .. }
             | Expression::Sub { left, right }
-            | Expression::SubOverflows { left, right, .. } => {
+            | Expression::SubOverflows { left, right, .. }
+            | Expression::TagPropagationUnion { left, right } => {
                 left.uses(variables) || right.uses(variables)
             }
             Expression::BitNot { operand, .. }
@@ -7169,6 +7362,7 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::WidenedJoin { operand, path } => {
                 operand.uses(variables) || variables.contains(path)
             }
+            Expression::AbstractedValue { tag_provenance, .. } => tag_provenance.0.uses(variables),
         }
     }
 
@@ -7195,6 +7389,185 @@ impl AbstractValueTrait for Rc<AbstractValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tag_domain::SerializableDefId;
+    use rustc_hir::def_id::{CrateNum, DefIndex};
+
+    #[test]
+    fn remainder_by_one_only_simplifies_integers() {
+        let integer =
+            AbstractValue::make_typed_unknown(ExpressionType::Usize, Path::new_parameter(1));
+        let integer_one = Rc::new(ConstantDomain::U128(1).into());
+        assert!(integer.remainder(integer_one).is_zero());
+
+        let float = AbstractValue::make_typed_unknown(ExpressionType::F32, Path::new_parameter(1));
+        let float_value_with_one_bits = Rc::new(ConstantDomain::F32(1).into());
+        assert!(matches!(
+            float.remainder(float_value_with_one_bits).expression,
+            Expression::Rem { .. }
+        ));
+    }
+
+    #[test]
+    fn summary_refinement_preserves_tags_on_abstracted_values() {
+        let tag = Tag {
+            def_id: SerializableDefId {
+                krate: CrateNum::from_u32(0),
+                index: DefIndex::from_u32(1),
+            },
+            prop_set: TAG_PROPAGATION_ALL,
+        };
+        let later_tag = Tag {
+            def_id: SerializableDefId {
+                krate: CrateNum::from_u32(0),
+                index: DefIndex::from_u32(2),
+            },
+            prop_set: TAG_PROPAGATION_ALL,
+        };
+        let symbolic_path = Path::new_field(
+            Path::new_deref(Path::new_parameter(1), ExpressionType::NonPrimitive),
+            7,
+        );
+        let symbolic =
+            AbstractValue::make_initial_parameter_value(ExpressionType::U8, symbolic_path.clone());
+        let widened = AbstractValue::make_from(
+            Expression::WidenedJoin {
+                path: symbolic_path,
+                operand: symbolic.clone(),
+            },
+            symbolic.expression_size + 1,
+        );
+        let abstracted = AbstractValue::make_from(
+            symbolic.expression.clone(),
+            k_limits::MAX_EXPRESSION_SIZE + 1,
+        );
+        let later_symbolic =
+            AbstractValue::make_initial_parameter_value(ExpressionType::U8, Path::new_parameter(2));
+        let joined_abstracted = abstracted.join(AbstractValue::make_from(
+            later_symbolic.expression.clone(),
+            k_limits::MAX_EXPRESSION_SIZE + 1,
+        ));
+        let right_abstracted = later_symbolic.bit_or(abstracted.clone());
+        let serialized = bincode::serialize(right_abstracted.as_ref()).unwrap();
+        let right_abstracted = Rc::new(bincode::deserialize::<AbstractValue>(&serialized).unwrap());
+        let abstracted = abstracted.bit_or(later_symbolic);
+        let serialized = bincode::serialize(abstracted.as_ref()).unwrap();
+        let abstracted = Rc::new(bincode::deserialize::<AbstractValue>(&serialized).unwrap());
+        assert_eq!(abstracted.get_cached_tags().has_tag(&tag), BoolDomain::Top);
+
+        let mut environment = Environment::default();
+        let operand: Rc<AbstractValue> = Rc::new(ConstantDomain::U128(1).into());
+        let tagged = operand.add_tag(tag);
+        let later_operand: Rc<AbstractValue> = Rc::new(ConstantDomain::U128(2).into());
+        let later_tagged = later_operand.add_tag(later_tag);
+        let argument_path = Path::new_local(1, 0);
+        let argument_field = Path::new_field(
+            Path::new_deref(argument_path.clone(), ExpressionType::NonPrimitive),
+            7,
+        );
+        environment.strong_update_value_at(argument_field, tagged);
+        let later_argument_path = Path::new_local(2, 0);
+        environment.strong_update_value_at(later_argument_path.clone(), later_tagged);
+        let arguments = [
+            (argument_path, Rc::new(TOP)),
+            (later_argument_path, Rc::new(TOP)),
+        ];
+        let refined = abstracted.refine_parameters_and_paths(
+            &arguments,
+            &None,
+            &environment,
+            &environment,
+            0,
+        );
+        assert_eq!(refined.get_cached_tags().has_tag(&tag), BoolDomain::True);
+        assert_eq!(
+            refined.get_cached_tags().has_tag(&later_tag),
+            BoolDomain::True
+        );
+        let refined_right = right_abstracted.refine_parameters_and_paths(
+            &arguments,
+            &None,
+            &environment,
+            &environment,
+            0,
+        );
+        assert_eq!(
+            refined_right.get_cached_tags().has_tag(&tag),
+            BoolDomain::True
+        );
+        assert_eq!(
+            refined_right.get_cached_tags().has_tag(&later_tag),
+            BoolDomain::True
+        );
+        let refined_join = joined_abstracted.refine_parameters_and_paths(
+            &arguments,
+            &None,
+            &environment,
+            &environment,
+            0,
+        );
+        assert_eq!(
+            refined_join.get_cached_tags().has_tag(&tag),
+            BoolDomain::True
+        );
+        assert_eq!(
+            refined_join.get_cached_tags().has_tag(&later_tag),
+            BoolDomain::True
+        );
+        let refined_widened =
+            widened.refine_parameters_and_paths(&arguments, &None, &environment, &environment, 0);
+        assert_eq!(
+            refined_widened.get_cached_tags().has_tag(&tag),
+            BoolDomain::True
+        );
+
+        let untagged: Rc<AbstractValue> = Rc::new(ConstantDomain::U128(1).into());
+        let mut untagged_environment = Environment::default();
+        let untagged_argument_path = Path::new_local(1, 0);
+        let untagged_argument_field = Path::new_field(
+            Path::new_deref(untagged_argument_path.clone(), ExpressionType::NonPrimitive),
+            7,
+        );
+        untagged_environment.strong_update_value_at(untagged_argument_field, untagged);
+        let later_untagged_argument_path = Path::new_local(2, 0);
+        untagged_environment.strong_update_value_at(
+            later_untagged_argument_path.clone(),
+            Rc::new(ConstantDomain::U128(2).into()),
+        );
+        let untagged_arguments = [
+            (untagged_argument_path, Rc::new(TOP)),
+            (later_untagged_argument_path, Rc::new(TOP)),
+        ];
+        let refined_untagged = abstracted.refine_parameters_and_paths(
+            &untagged_arguments,
+            &None,
+            &untagged_environment,
+            &untagged_environment,
+            0,
+        );
+        assert_eq!(
+            refined_untagged.get_cached_tags().has_tag(&tag),
+            BoolDomain::False
+        );
+        assert_eq!(
+            refined_untagged.get_cached_tags().has_tag(&later_tag),
+            BoolDomain::False
+        );
+        let refined_untagged_right = right_abstracted.refine_parameters_and_paths(
+            &untagged_arguments,
+            &None,
+            &untagged_environment,
+            &untagged_environment,
+            0,
+        );
+        assert_eq!(
+            refined_untagged_right.get_cached_tags().has_tag(&tag),
+            BoolDomain::False
+        );
+        assert_eq!(
+            refined_untagged_right.get_cached_tags().has_tag(&later_tag),
+            BoolDomain::False
+        );
+    }
 
     #[test]
     fn references_remain_non_null_after_address_conversion() {

@@ -227,6 +227,34 @@ impl TagDomain {
         }
     }
 
+    /// Join two control-flow alternatives, using may-tag semantics for tags that opt in to
+    /// [`TagPropagation::ControlFlow`] and must-tag semantics for all other tags.
+    #[logfn_inputs(TRACE)]
+    #[must_use]
+    pub fn join_control_flow(&self, other: &Self) -> Self {
+        let mut new_map = rbt_map![];
+        for tag in self.map.keys().chain(other.map.keys()) {
+            let self_val = self.map.get(tag).unwrap_or(&self.value_for_untracked_tags);
+            let other_val = other
+                .map
+                .get(tag)
+                .unwrap_or(&other.value_for_untracked_tags);
+            let new_val = if tag.is_propagated_by(TagPropagation::ControlFlow) {
+                self_val.or(other_val)
+            } else {
+                self_val.join(other_val)
+            };
+            new_map.insert_mut(*tag, new_val);
+        }
+        TagDomain {
+            map: new_map,
+            // The propagation set of an untracked tag is not known, so retain must-tag semantics.
+            value_for_untracked_tags: self
+                .value_for_untracked_tags
+                .join(&other.value_for_untracked_tags),
+        }
+    }
+
     /// Return a tag domain element that filters out tags which are not propagated by an expression.
     /// The expression kind is identified by `exp_tag_prop`.
     #[logfn_inputs(TRACE)]

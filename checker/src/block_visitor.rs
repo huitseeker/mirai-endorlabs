@@ -603,28 +603,6 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         unwind: mir::UnwindAction,
         fn_span: &rustc_span::Span,
     ) {
-        if self
-            .bv
-            .current_environment
-            .entry_condition
-            .as_bool_if_known()
-            == Some(false)
-        {
-            if let Some(target) = target {
-                self.bv
-                    .current_environment
-                    .exit_conditions
-                    .insert_mut(target, self.bv.current_environment.entry_condition.clone());
-            }
-            if let mir::UnwindAction::Cleanup(unwind_target) = unwind {
-                self.bv.current_environment.exit_conditions.insert_mut(
-                    unwind_target,
-                    self.bv.current_environment.entry_condition.clone(),
-                );
-            }
-            return;
-        }
-
         // This offset is used to distinguish any local variables that leak out from the called function
         // from local variables of the callee function.
         // This situation arises when a structured value stored in a local variable is assigned to

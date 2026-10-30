@@ -161,6 +161,7 @@ pub enum KnownNames {
     StdOpsFunctionFnCall,
     StdOpsFunctionFnMutCallMut,
     StdOpsFunctionFnOnceCallOnce,
+    StdOpsIndexIndex,
     StdPanickingAssertFailed,
     StdPanickingBeginPanic,
     StdPanickingBeginPanicFmt,
@@ -169,6 +170,9 @@ pub enum KnownNames {
     RustNoAllocShimIsUnstable,
     StdIntrinsicsAtomicXchg,
     StdArrayFromFn,
+    StdArrayMap,
+    StdIterIntoIteratorIntoIter,
+    StdIterIteratorNext,
 }
 
 /// An analysis lifetime cache that contains a map from def ids to known names.
@@ -266,12 +270,21 @@ fn known_name_for_std_lib(path_segments: &[DisambiguatedDefPathData]) -> Option<
     match path_segments {
         [current_segment, tail_segments @ ..] => match name_from_type_ns(current_segment)? {
             "alloc" => get_known_name_for_alloc_namespace(tail_segments),
-            "array" => known_name_for_terminal_from_ns!(
-                tail_segments,
-                DefPathData::ValueNs,
-                "from_fn",
-                KnownNames::StdArrayFromFn
-            ),
+            "array" => match tail_segments {
+                [current_segment] => match_names!(
+                    name_from_value_ns(current_segment)?,
+                    "from_fn" => KnownNames::StdArrayFromFn,
+                ),
+                [impl_segment, current_segment]
+                    if matches!(impl_segment.data, DefPathData::Impl) =>
+                {
+                    match_names!(
+                        name_from_value_ns(current_segment)?,
+                        "map" => KnownNames::StdArrayMap,
+                    )
+                }
+                _ => None,
+            },
             "clone" => get_known_name_for_clone_namespace(tail_segments),
             "future" => known_name_for_terminal_from_ns!(
                 tail_segments,
@@ -281,6 +294,30 @@ fn known_name_for_std_lib(path_segments: &[DisambiguatedDefPathData]) -> Option<
                 KnownNames::StdFutureFromGenerator
             ),
             "intrinsics" => known_name_for_intrinsics_namespace(tail_segments),
+            "iter" => match tail_segments {
+                [trait_segment, method_segment] => match_names!(
+                    (
+                        name_from_type_ns(trait_segment)?,
+                        name_from_value_ns(method_segment)?,
+                    ),
+                    ("IntoIterator", "into_iter") => KnownNames::StdIterIntoIteratorIntoIter,
+                    ("Iterator", "next") => KnownNames::StdIterIteratorNext,
+                ),
+                [traits_segment, module_segment, trait_segment, method_segment]
+                    if name_from_type_ns(traits_segment)? == "traits"
+                        && matches!(name_from_type_ns(module_segment)?, "collect" | "iterator") =>
+                {
+                    match_names!(
+                        (
+                            name_from_type_ns(trait_segment)?,
+                            name_from_value_ns(method_segment)?,
+                        ),
+                        ("IntoIterator", "into_iter") => KnownNames::StdIterIntoIteratorIntoIter,
+                        ("Iterator", "next") => KnownNames::StdIterIteratorNext,
+                    )
+                }
+                _ => None,
+            },
             "marker" => known_name_for_terminal_from_ns!(
                 tail_segments,
                 DefPathData::TypeNs,
@@ -492,7 +529,8 @@ fn known_name_for_ops_namespace(path_segments: &[DisambiguatedDefPathData]) -> O
             ("function", "FnMut", "call_mut") => KnownNames::StdOpsFunctionFnMutCallMut,
             ("function", "FnOnce", "call_once" | "call_once_force") => {
                 KnownNames::StdOpsFunctionFnOnceCallOnce
-            }
+            },
+            ("index", "Index", "index") => KnownNames::StdOpsIndexIndex,
         ),
         _ => None,
     }
@@ -551,6 +589,25 @@ fn known_name_for_slice_namespace(
     path_segments: &[DisambiguatedDefPathData],
 ) -> Option<KnownNames> {
     match path_segments {
+        [iter_segment, impl_segment, method_segment]
+            if name_from_type_ns(iter_segment)? == "iter"
+                && matches!(impl_segment.data, DefPathData::Impl) =>
+        {
+            match_names!(
+                name_from_value_ns(method_segment)?,
+                "into_iter" => KnownNames::StdIterIntoIteratorIntoIter,
+            )
+        }
+        [iter_segment, iter_type_segment, impl_segment, method_segment]
+            if name_from_type_ns(iter_segment)? == "iter"
+                && name_from_type_ns(iter_type_segment)? == "Iter"
+                && matches!(impl_segment.data, DefPathData::Impl) =>
+        {
+            match_names!(
+                name_from_value_ns(method_segment)?,
+                "next" => KnownNames::StdIterIteratorNext,
+            )
+        }
         [current_segment, middle_segment, last_segment] => {
             let current_name = name_from_type_ns(current_segment)?;
             let last_name = name_from_value_ns(last_segment)?;

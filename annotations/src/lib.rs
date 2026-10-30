@@ -131,6 +131,8 @@ pub enum TagPropagation {
     SuperComponent,
     Transmute,
     UninterpretedCall,
+    /// Tags from either control-flow alternative propagate to the joined value.
+    ControlFlow,
 }
 
 impl TagPropagation {
@@ -185,7 +187,8 @@ pub const TAG_PROPAGATION_ALL: TagPropagationSet = tag_propagation_set!(
     TagPropagation::SubOverflows,
     TagPropagation::SuperComponent,
     TagPropagation::Transmute,
-    TagPropagation::UninterpretedCall
+    TagPropagation::UninterpretedCall,
+    TagPropagation::ControlFlow
 );
 
 /// Equivalent to a no op when used with an unmodified Rust compiler.

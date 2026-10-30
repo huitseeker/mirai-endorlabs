@@ -52,6 +52,7 @@ pub struct BodyVisitor<'analysis, 'compilation, 'tcx> {
 
     pub already_reported_errors_for_call_to: HashSet<Rc<AbstractValue>>,
     pub analyzing_static_var: bool,
+    pub array_iterator_loop_lengths: HashMap<mir::BasicBlock, usize>,
     // True if the current function cannot be completely analyzed.
     pub analysis_is_incomplete: bool,
     pub assume_preconditions_of_next_call: bool,
@@ -123,6 +124,7 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
 
             already_reported_errors_for_call_to: HashSet::new(),
             analyzing_static_var: false,
+            array_iterator_loop_lengths: HashMap::new(),
             analysis_is_incomplete: false,
             assume_preconditions_of_next_call: false,
             async_fn_summary: None,
@@ -440,7 +442,9 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                 local_val
             }
         };
-        let mut result = if refined_val.is_top() {
+        let mut result = if refined_val.is_top()
+            && !matches!(refined_val.expression, Expression::AbstractedValue { .. })
+        {
             if path.path_length() < k_limits::MAX_PATH_LENGTH {
                 let mut result = None;
                 if let PathEnum::QualifiedPath {
@@ -1327,10 +1331,12 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                         let t = self
                             .type_visitor
                             .get_path_rustc_type(path, self.current_span);
-                        if t.is_never() {
+                        if t.is_never()
+                            || ExpressionType::from(t.kind()) != ExpressionType::NonPrimitive
+                        {
                             // The right hand value has lost precision in such a way that we cannot
-                            // even get its rustc type. In that case, let's try using the type of
-                            // the left hand value.
+                            // get a rustc type consistent with its abstract value. In that case,
+                            // use the type of the left hand value.
                             let t = self
                                 .type_visitor
                                 .get_path_rustc_type(&tpath, self.current_span);
@@ -2071,6 +2077,9 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         let Some(target_length) = target_length else {
             return false;
         };
+        if target_length >= k_limits::MAX_ELEMENTS_TO_TRACK {
+            return false;
+        }
         if source_length.is_some_and(|length| length != target_length) {
             return false;
         }
@@ -2111,8 +2120,15 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         accumulator: &mut Vec<(Rc<Path>, Ty<'tcx>)>,
     ) {
         match ty.kind() {
+            TyKind::Adt(def, args) if def.is_struct() && def.repr().c() => {
+                for (index, _) in def.non_enum_variant().fields.iter().enumerate() {
+                    let field_path = Path::new_field(path.clone(), index);
+                    let field_type = self.type_visitor().get_field_type(def, args, index);
+                    self.add_nested_leaf_fields_for(field_path, field_type, accumulator);
+                }
+            }
             TyKind::Adt(def, args) => {
-                self.add_leaf_fields_for(path, def, args, self.tcx, accumulator)
+                self.add_leaf_fields_for(path, def, args, self.tcx, accumulator);
             }
             TyKind::Array(element_type, length) => {
                 let length = self.get_array_length(length);
@@ -2133,11 +2149,23 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         if candidate_type == element_type {
             return Some(1);
         }
-        let TyKind::Array(nested_type, length) = candidate_type.kind() else {
-            return None;
-        };
-        let nested_count = self.homogeneous_element_count(*nested_type, element_type)?;
-        nested_count.checked_mul(self.get_array_length(length))
+        match candidate_type.kind() {
+            TyKind::Array(nested_type, length) => {
+                let nested_count = self.homogeneous_element_count(*nested_type, element_type)?;
+                nested_count.checked_mul(self.get_array_length(length))
+            }
+            TyKind::Adt(def, args) if def.is_struct() && def.repr().c() => {
+                def.non_enum_variant().fields.iter().enumerate().try_fold(
+                    0_usize,
+                    |count, (index, _)| {
+                        let field_type = self.type_visitor().get_field_type(def, args, index);
+                        self.homogeneous_element_count(field_type, element_type)
+                            .and_then(|field_count| count.checked_add(field_count))
+                    },
+                )
+            }
+            _ => None,
+        }
     }
 
     /// Assign abstract values to the target fields that are consistent with the concrete values

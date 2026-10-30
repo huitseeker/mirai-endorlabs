@@ -471,6 +471,26 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         // meaning.
         _replace: bool,
     ) {
+        if self
+            .bv
+            .current_environment
+            .entry_condition
+            .as_bool_if_known()
+            == Some(false)
+        {
+            self.bv
+                .current_environment
+                .exit_conditions
+                .insert_mut(target, self.bv.current_environment.entry_condition.clone());
+            if let mir::UnwindAction::Cleanup(unwind_target) = unwind {
+                self.bv.current_environment.exit_conditions.insert_mut(
+                    unwind_target,
+                    self.bv.current_environment.entry_condition.clone(),
+                );
+            }
+            return;
+        }
+
         let tcx = self.bv.cv.tcx;
         let place_path = self.get_path_for_place(place);
         let path = place_path.canonicalize(&self.bv.current_environment);
@@ -583,6 +603,28 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         unwind: mir::UnwindAction,
         fn_span: &rustc_span::Span,
     ) {
+        if self
+            .bv
+            .current_environment
+            .entry_condition
+            .as_bool_if_known()
+            == Some(false)
+        {
+            if let Some(target) = target {
+                self.bv
+                    .current_environment
+                    .exit_conditions
+                    .insert_mut(target, self.bv.current_environment.entry_condition.clone());
+            }
+            if let mir::UnwindAction::Cleanup(unwind_target) = unwind {
+                self.bv.current_environment.exit_conditions.insert_mut(
+                    unwind_target,
+                    self.bv.current_environment.entry_condition.clone(),
+                );
+            }
+            return;
+        }
+
         // This offset is used to distinguish any local variables that leak out from the called function
         // from local variables of the callee function.
         // This situation arises when a structured value stored in a local variable is assigned to
@@ -2273,15 +2315,16 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         (source_type.kind(), ty.kind())
                     {
                         if let TyKind::Slice(element_type) = source.kind() {
+                            let source_elements = Path::new_deref(
+                                source_path.clone(),
+                                ExpressionType::NonPrimitive,
+                            );
                             let target_path = Path::new_index(
-                                Path::new_deref(
-                                    source_path.clone(),
-                                    ExpressionType::NonPrimitive,
-                                ),
+                                source_elements.clone(),
                                 Rc::new(0_u128.into()),
                             );
                             self.bv.copy_array_elements_to_struct_layout(
-                                source_path.clone(),
+                                source_elements,
                                 target_path,
                                 *element_type,
                                 None,
@@ -2335,7 +2378,12 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             let length_value = self.visit_const(len);
             self.bv.update_value_at(length_path, length_value);
         } else {
-            assume_unreachable!("non array thin pointer type {:?}", source_type);
+            // Some pointer coercions expose only the element pointer here. The metadata may be
+            // written separately, so retain a sound unknown length instead of rejecting the cast.
+            let length_path = target_path.add_or_replace_selector(Rc::new(PathSelector::Field(1)));
+            let length_value =
+                AbstractValue::make_typed_unknown(ExpressionType::Usize, length_path.clone());
+            self.bv.update_value_at(length_path, length_value);
         }
     }
 

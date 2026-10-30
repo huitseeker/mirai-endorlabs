@@ -43,6 +43,50 @@ impl Debug for FixedPointVisitor<'_, '_, '_, '_> {
 impl<'fixed, 'analysis, 'compilation, 'tcx>
     FixedPointVisitor<'fixed, 'analysis, 'compilation, 'tcx>
 {
+    fn can_unroll_array_loop(&self, loop_anchor: mir::BasicBlock) -> bool {
+        if !self
+            .bv
+            .array_iterator_loop_lengths
+            .contains_key(&loop_anchor)
+        {
+            return false;
+        }
+
+        let mut loop_blocks = HashSet::new();
+        let mut pending = vec![loop_anchor];
+        while let Some(block) = pending.pop() {
+            if !loop_blocks.insert(block) {
+                continue;
+            }
+            pending.extend(
+                self.bv.mir.basic_blocks.predecessors()[block]
+                    .iter()
+                    .copied()
+                    .filter(|predecessor| self.dominators.dominates(loop_anchor, *predecessor)),
+            );
+        }
+
+        let mut normal_exit_edges = 0;
+        for block in &loop_blocks {
+            for successor in self.bv.mir.basic_blocks[*block].terminator().successors() {
+                if loop_blocks.contains(&successor) {
+                    continue;
+                }
+                let successor_data = &self.bv.mir.basic_blocks[successor];
+                if successor_data.is_cleanup
+                    || matches!(
+                        successor_data.terminator().kind,
+                        mir::TerminatorKind::Unreachable
+                    )
+                {
+                    continue;
+                }
+                normal_exit_edges += 1;
+            }
+        }
+        normal_exit_edges == 1
+    }
+
     #[logfn_inputs(TRACE)]
     pub fn new(
         body_visitor: &'fixed mut BodyVisitor<'analysis, 'compilation, 'tcx>,
@@ -99,8 +143,20 @@ impl<'fixed, 'analysis, 'compilation, 'tcx>
         } else {
             self.get_initial_state_from_predecessors(bb, iteration_count)
         };
+        // Fixed-size array iteration is modeled with an exact cursor, so keep each iteration
+        // separate until the iterator is exhausted. Joining it with the pre-loop state would lose
+        // correlations between the cursor and values updated by the loop body.
+        let unroll_array_iteration = self
+            .bv
+            .array_iterator_loop_lengths
+            .get(&bb)
+            .is_some_and(|length| iteration_count > 1 && iteration_count <= length + 1)
+            && self.can_unroll_array_loop(bb);
+
         // Note that iteration_count is zero unless bb is a loop anchor.
-        if iteration_count == 2 || iteration_count == 3 {
+        if unroll_array_iteration {
+            // `i_state` is the state from the preceding concrete iteration.
+        } else if iteration_count == 2 || iteration_count == 3 {
             // We do not have (and don't want to have) a way to distinguish the value of a widened
             // loop variable in one iteration from its value in the previous iteration, so
             // conditions involving loop variables are not referentially transparent
@@ -152,6 +208,15 @@ impl<'fixed, 'analysis, 'compilation, 'tcx>
             changed = result.0;
             last_block = result.1;
             check_for_early_break!(self.bv);
+            if self
+                .bv
+                .array_iterator_loop_lengths
+                .get(&loop_anchor)
+                .is_some_and(|length| iteration_count > *length)
+                && self.can_unroll_array_loop(loop_anchor)
+            {
+                break;
+            }
             if iteration_count >= k_limits::MAX_FIXPOINT_ITERATIONS {
                 break;
             }

@@ -7,8 +7,10 @@ use log_derive::*;
 use mirai_annotations::*;
 use rustc_middle::ty::{FloatTy, IntTy, Ty, TyCtxt, TyKind, UintTy};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter, Result};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::abstract_value::{AbstractValue, AbstractValueTrait};
@@ -431,6 +433,52 @@ pub enum Expression {
         /// all result in the same widened value.
         operand: Rc<AbstractValue>,
     },
+
+    /// A numerically unknown value that retains the expression from which its tags originated.
+    ///
+    /// This is distinct from `Top`: callers can refine parameter paths in `tag_provenance`
+    /// after loading a function summary, while numeric reasoning still treats the value as top.
+    AbstractedValue {
+        tag_provenance: TagProvenance,
+        var_type: ExpressionType,
+    },
+
+    /// The union of tag provenance from control-flow alternatives.
+    ///
+    /// This expression is only stored inside an [`Expression::AbstractedValue`]. It has no
+    /// numeric meaning; unlike [`Expression::Join`], its tag domain is the union of both inputs.
+    TagPropagationUnion {
+        left: Rc<AbstractValue>,
+        right: Rc<AbstractValue>,
+    },
+}
+
+/// Symbolic tag provenance that does not participate in numeric value identity.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TagProvenance(pub Rc<AbstractValue>);
+
+impl PartialEq for TagProvenance {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TagProvenance {}
+
+impl Hash for TagProvenance {
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
+}
+
+impl PartialOrd for TagProvenance {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TagProvenance {
+    fn cmp(&self, _other: &Self) -> Ordering {
+        Ordering::Equal
+    }
 }
 
 /// Used by Expression::AbstractHeapBlockLayout
@@ -620,6 +668,12 @@ impl Debug for Expression {
                     f.write_fmt(format_args!("widened({operand:?}) at {path:?}"))
                 }
             }
+            Expression::AbstractedValue { var_type, .. } => {
+                f.write_fmt(format_args!("TOP: {var_type:?}"))
+            }
+            Expression::TagPropagationUnion { left, right } => {
+                f.write_fmt(format_args!("tag_union({left:?}, {right:?})"))
+            }
         }
     }
 }
@@ -654,7 +708,8 @@ impl Expression {
             | Expression::Shr { left, right, .. }
             | Expression::ShrOverflows { left, right, .. }
             | Expression::Sub { left, right }
-            | Expression::SubOverflows { left, right, .. } => {
+            | Expression::SubOverflows { left, right, .. }
+            | Expression::TagPropagationUnion { left, right } => {
                 left.expression.contains_local_variable(is_post_condition)
                     || right.expression.contains_local_variable(is_post_condition)
             }
@@ -744,6 +799,10 @@ impl Expression {
             Expression::WidenedJoin { operand, .. } => operand
                 .expression
                 .contains_local_variable(is_post_condition),
+            Expression::AbstractedValue { tag_provenance, .. } => tag_provenance
+                .0
+                .expression
+                .contains_local_variable(is_post_condition),
         }
     }
 
@@ -775,7 +834,8 @@ impl Expression {
             | Expression::Shr { left, right, .. }
             | Expression::ShrOverflows { left, right, .. }
             | Expression::Sub { left, right }
-            | Expression::SubOverflows { left, right, .. } => {
+            | Expression::SubOverflows { left, right, .. }
+            | Expression::TagPropagationUnion { left, right } => {
                 left.expression.contains_top() || right.expression.contains_top()
             }
             Expression::BitNot { operand, .. }
@@ -835,6 +895,7 @@ impl Expression {
                 path.contains_top()
             }
             Expression::WidenedJoin { operand, .. } => operand.expression.contains_top(),
+            Expression::AbstractedValue { .. } => true,
         }
     }
 
@@ -898,6 +959,8 @@ impl Expression {
             Expression::UnknownTagField { .. } => None,
             Expression::Variable { .. } => None,
             Expression::WidenedJoin { .. } => None,
+            Expression::AbstractedValue { .. } => None,
+            Expression::TagPropagationUnion { .. } => None,
         }
     }
 
@@ -1005,6 +1068,14 @@ impl Expression {
             }
             Expression::WidenedJoin { operand, .. } => {
                 operand.expression.has_tagged_subcomponent(tag, env)
+            }
+            Expression::AbstractedValue { tag_provenance, .. } => tag_provenance
+                .0
+                .expression
+                .has_tagged_subcomponent(tag, env),
+            Expression::TagPropagationUnion { left, right } => {
+                left.expression.has_tagged_subcomponent(tag, env)
+                    || right.expression.has_tagged_subcomponent(tag, env)
             }
         }
     }
@@ -1209,6 +1280,8 @@ impl Expression {
             Expression::UnknownTagField { .. } => I8,
             Expression::Variable { var_type, .. } => *var_type,
             Expression::WidenedJoin { operand, .. } => operand.expression.infer_type(),
+            Expression::AbstractedValue { var_type, .. } => *var_type,
+            Expression::TagPropagationUnion { left, .. } => left.expression.infer_type(),
         }
     }
 
@@ -1321,7 +1394,8 @@ impl Expression {
             | Expression::Shr { left, right, .. }
             | Expression::ShrOverflows { left, right, .. }
             | Expression::Sub { left, right }
-            | Expression::SubOverflows { left, right, .. } => {
+            | Expression::SubOverflows { left, right, .. }
+            | Expression::TagPropagationUnion { left, right } => {
                 left.expression.record_heap_blocks_and_strings(result);
                 right.expression.record_heap_blocks_and_strings(result);
             }
@@ -1402,6 +1476,9 @@ impl Expression {
             }
             Expression::UnknownTagField { path } => {
                 path.record_heap_blocks_and_strings(result);
+            }
+            Expression::AbstractedValue { tag_provenance, .. } => {
+                tag_provenance.0.record_heap_blocks_and_strings(result);
             }
         }
     }

@@ -585,7 +585,8 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
         }
     }
 
-    /// If there is a path of the form key_qualifier[0..n] = v then return v.
+    /// If there is a path of the form key_qualifier[0..n] = v then return v. For immutable arrays
+    /// with every element present in the environment, construct an index-dependent value instead.
     /// todo: if there are paths of the form key_qualifier[i] = vi where we could have i == key_index
     /// at runtime, then return a conditional expression that uses v as the default value (if there
     /// is a [0..n] path, otherwise zero or unknown).
@@ -593,11 +594,45 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
     fn lookup_weak_value(
         &mut self,
         key_qualifier: &Rc<Path>,
-        _key_index: &Rc<AbstractValue>,
+        key_index: &Rc<AbstractValue>,
     ) -> Option<Rc<AbstractValue>> {
+        const MAX_SYMBOLIC_ARRAY_LENGTH: usize = 256;
+
         if self.analyzing_static_var {
             return None;
         }
+        if !matches!(
+            key_qualifier.get_path_root().value,
+            PathEnum::StaticVariable { .. } | PathEnum::PromotedConstant { .. }
+        ) && !self.tcx.is_const_fn(self.def_id)
+        {
+            return None;
+        }
+        if self.current_environment.value_map.keys().any(|path| {
+            matches!(
+                &path.value,
+                PathEnum::QualifiedPath { selector, .. }
+                    if matches!(
+                        selector.as_ref(),
+                        PathSelector::ModelField(..) | PathSelector::TagField
+                    )
+            )
+        }) {
+            // Flattening element paths would discard tag and model-field updates.
+            return None;
+        }
+        let array_length = self
+            .current_environment
+            .value_at(&Path::new_length(key_qualifier.clone()))
+            .and_then(|value| match value.expression {
+                Expression::CompileTimeConstant(ConstantDomain::U128(length)) => {
+                    usize::try_from(length).ok()
+                }
+                _ => None,
+            })
+            // Keep the resulting conditional expression bounded.
+            .filter(|length| *length <= MAX_SYMBOLIC_ARRAY_LENGTH);
+        let mut indexed_values = HashMap::new();
         for (path, value) in self.current_environment.value_map.iter() {
             if let PathEnum::QualifiedPath {
                 qualifier,
@@ -615,11 +650,39 @@ impl<'analysis, 'compilation, 'tcx> BodyVisitor<'analysis, 'compilation, 'tcx> {
                         return Some(value.clone());
                     }
                 }
-                // todo: deal with PathSelector::Index when there is a possibility that
-                // key_index might match it at runtime.
+                if value.expression.infer_type().is_primitive() && key_qualifier.eq(qualifier) {
+                    if let PathSelector::Index(index) = selector.as_ref() {
+                        if index.equals(key_index.clone()).as_bool_if_known() == Some(true) {
+                            return Some(value.clone());
+                        }
+                        if let Expression::CompileTimeConstant(ConstantDomain::U128(index)) =
+                            index.expression
+                        {
+                            if let Ok(index) = usize::try_from(index) {
+                                if array_length.is_some_and(|length| index < length) {
+                                    indexed_values.insert(index, value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        None
+        let array_length = array_length?;
+        if indexed_values.len() != array_length {
+            return None;
+        }
+        (0..array_length)
+            .rev()
+            .try_fold(Rc::new(BOTTOM), |result, index| {
+                let value = indexed_values.get(&index)?.clone();
+                let index = self.get_u128_const_val(index as u128);
+                Some(
+                    key_index
+                        .equals(index)
+                        .conditional_expression(value, result),
+                )
+            })
     }
 
     /// Ensures that the static specified by the path is included in the current environment.

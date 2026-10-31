@@ -172,7 +172,10 @@ pub enum KnownNames {
     StdArrayFromFn,
     StdArrayMap,
     StdIterIntoIteratorIntoIter,
+    StdIterIteratorCollect,
+    StdIterIteratorMap,
     StdIterIteratorNext,
+    StdSliceIter,
 }
 
 /// An analysis lifetime cache that contains a map from def ids to known names.
@@ -301,6 +304,8 @@ fn known_name_for_std_lib(path_segments: &[DisambiguatedDefPathData]) -> Option<
                         name_from_value_ns(method_segment)?,
                     ),
                     ("IntoIterator", "into_iter") => KnownNames::StdIterIntoIteratorIntoIter,
+                    ("Iterator", "collect") => KnownNames::StdIterIteratorCollect,
+                    ("Iterator", "map") => KnownNames::StdIterIteratorMap,
                     ("Iterator", "next") => KnownNames::StdIterIteratorNext,
                 ),
                 [traits_segment, module_segment, trait_segment, method_segment]
@@ -313,6 +318,8 @@ fn known_name_for_std_lib(path_segments: &[DisambiguatedDefPathData]) -> Option<
                             name_from_value_ns(method_segment)?,
                         ),
                         ("IntoIterator", "into_iter") => KnownNames::StdIterIntoIteratorIntoIter,
+                        ("Iterator", "collect") => KnownNames::StdIterIteratorCollect,
+                        ("Iterator", "map") => KnownNames::StdIterIteratorMap,
                         ("Iterator", "next") => KnownNames::StdIterIteratorNext,
                     )
                 }
@@ -589,6 +596,12 @@ fn known_name_for_slice_namespace(
     path_segments: &[DisambiguatedDefPathData],
 ) -> Option<KnownNames> {
     match path_segments {
+        [impl_segment, method_segment] if matches!(impl_segment.data, DefPathData::Impl) => {
+            match_names!(
+                name_from_value_ns(method_segment)?,
+                "iter" => KnownNames::StdSliceIter,
+            )
+        }
         [iter_segment, impl_segment, method_segment]
             if name_from_type_ns(iter_segment)? == "iter"
                 && matches!(impl_segment.data, DefPathData::Impl) =>

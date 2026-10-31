@@ -489,6 +489,21 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     return true;
                 }
             }
+            KnownNames::StdSliceIter => {
+                if self.handle_array_into_iter() {
+                    return true;
+                }
+            }
+            KnownNames::StdIterIteratorMap => {
+                if self.handle_slice_iterator_map() {
+                    return true;
+                }
+            }
+            KnownNames::StdIterIteratorCollect => {
+                if self.handle_slice_map_collect() {
+                    return true;
+                }
+            }
             KnownNames::StdIterIteratorNext => {
                 if self.handle_array_into_iter_next() {
                     return true;
@@ -906,7 +921,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     }
                 };
                 let length = self.block_visitor.bv.lookup_path_and_refine_result(
-                    Path::new_length(source_path.clone()),
+                    Path::new_length(self.actual_args[0].0.clone()),
                     self.block_visitor.bv.tcx.types.usize,
                 );
                 (length, Some(source_path))
@@ -949,6 +964,241 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             Path::new_model_field(iterator_path, Rc::from("mirai_array_into_iter_length")),
             length,
         );
+        self.use_entry_condition_as_exit_condition();
+        true
+    }
+
+    /// Preserve the source slice and closure when constructing a `Map` over a modeled slice
+    /// iterator. `handle_slice_map_collect` uses this state when it materializes the result.
+    fn handle_slice_iterator_map(&mut self) -> bool {
+        checked_assume!(self.actual_args.len() == 2);
+        checked_assume!(self.actual_argument_types.len() == 2);
+
+        let TyKind::Adt(source_def, _) = self.actual_argument_types[0].kind() else {
+            return false;
+        };
+        let source_name = self.block_visitor.bv.tcx.def_path_str(source_def.did());
+        if !source_name.ends_with("slice::Iter") && !source_name.ends_with("slice::iter::Iter") {
+            return false;
+        }
+        let result_type = self
+            .type_visitor()
+            .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
+        let TyKind::Adt(result_def, _) = result_type.kind() else {
+            return false;
+        };
+        let result_name = self.block_visitor.bv.tcx.def_path_str(result_def.did());
+        if !result_name.ends_with("iter::Map") && !result_name.ends_with("iter::adapters::map::Map")
+        {
+            return false;
+        }
+
+        let source_path = self.actual_args[0].0.clone();
+        let result_path = self.block_visitor.visit_rh_place(&self.destination);
+        for field_name in [
+            "mirai_array_into_iter_data",
+            "mirai_array_into_iter_cursor",
+            "mirai_array_into_iter_length",
+        ] {
+            let source_field = Path::new_model_field(source_path.clone(), Rc::from(field_name));
+            let Some(value) = self
+                .block_visitor
+                .bv
+                .current_environment
+                .value_at(&source_field)
+                .cloned()
+            else {
+                return false;
+            };
+            self.block_visitor.bv.update_value_at(
+                Path::new_model_field(result_path.clone(), Rc::from(field_name)),
+                value,
+            );
+        }
+
+        let closure_type = self.actual_argument_types[1];
+        let closure_path =
+            Path::new_model_field(result_path, Rc::from("mirai_slice_iterator_map_closure"));
+        self.type_visitor_mut()
+            .set_path_rustc_type(closure_path.clone(), closure_type);
+        self.block_visitor.bv.copy_or_move_elements(
+            closure_path,
+            self.actual_args[1].0.clone(),
+            closure_type,
+            false,
+        );
+        self.use_entry_condition_as_exit_condition();
+        true
+    }
+
+    /// Preserve the exact length when a capture-free, result-only `Map` over a modeled slice
+    /// iterator is collected into a `Vec`. Collected elements remain unknown.
+    fn handle_slice_map_collect(&mut self) -> bool {
+        checked_assume!(self.actual_args.len() == 1);
+        checked_assume!(self.actual_argument_types.len() == 1);
+
+        let source_type = self.actual_argument_types[0];
+        let TyKind::Adt(source_def, source_args) = source_type.kind() else {
+            return false;
+        };
+        let source_name = self.block_visitor.bv.tcx.def_path_str(source_def.did());
+        if !source_name.ends_with("iter::Map") && !source_name.ends_with("iter::adapters::map::Map")
+        {
+            return false;
+        }
+        let mut source_types = source_args.types();
+        let Some(iterator_type) = source_types.next() else {
+            return false;
+        };
+        let Some(closure_type) = source_types.next() else {
+            return false;
+        };
+        let TyKind::Adt(iterator_def, iterator_args) = iterator_type.kind() else {
+            return false;
+        };
+        let iterator_name = self.block_visitor.bv.tcx.def_path_str(iterator_def.did());
+        if !iterator_name.ends_with("slice::Iter") && !iterator_name.ends_with("slice::iter::Iter")
+        {
+            return false;
+        }
+        let Some(element_type) = iterator_args.types().next() else {
+            return false;
+        };
+
+        let result_type = self
+            .type_visitor()
+            .get_rustc_place_type(&self.destination, self.block_visitor.bv.current_span);
+        let TyKind::Adt(result_def, _) = result_type.kind() else {
+            return false;
+        };
+        let result_name = self.block_visitor.bv.tcx.def_path_str(result_def.did());
+        if !result_name.ends_with("vec::Vec") {
+            return false;
+        }
+
+        let source_path = self.actual_args[0].0.clone();
+        let cursor = self.block_visitor.bv.lookup_path_and_refine_result(
+            Path::new_model_field(
+                source_path.clone(),
+                Rc::from("mirai_array_into_iter_cursor"),
+            ),
+            self.block_visitor.bv.tcx.types.usize,
+        );
+        let length = self.block_visitor.bv.lookup_path_and_refine_result(
+            Path::new_model_field(
+                source_path.clone(),
+                Rc::from("mirai_array_into_iter_length"),
+            ),
+            self.block_visitor.bv.tcx.types.usize,
+        );
+        let Expression::CompileTimeConstant(ConstantDomain::U128(cursor)) = &cursor.expression
+        else {
+            return false;
+        };
+
+        let data_path =
+            Path::new_model_field(source_path.clone(), Rc::from("mirai_array_into_iter_data"));
+        let Some(data) = self
+            .block_visitor
+            .bv
+            .current_environment
+            .value_at(&data_path)
+            .cloned()
+        else {
+            return false;
+        };
+        let Expression::Reference(data_path) = &data.expression else {
+            return false;
+        };
+        let closure_path =
+            Path::new_model_field(source_path, Rc::from("mirai_slice_iterator_map_closure"));
+        self.type_visitor_mut()
+            .set_path_rustc_type(closure_path.clone(), closure_type);
+        let closure = AbstractValue::make_reference(closure_path.clone());
+        let Some(func_ref) = self.block_visitor.get_func_ref(&closure) else {
+            return false;
+        };
+        let Some(def_id) = func_ref.def_id else {
+            return false;
+        };
+        let generic_arguments = match closure_type.kind() {
+            TyKind::Closure(_, args) => Some(self.type_visitor().specialize_generic_args(
+                args.as_closure().args,
+                &self.type_visitor().generic_argument_map,
+            )),
+            TyKind::FnDef(_, args) => Some(self.type_visitor().specialize_generic_args(
+                args.skip_binder(),
+                &self.type_visitor().generic_argument_map,
+            )),
+            _ => return false,
+        };
+
+        let tcx = self.block_visitor.bv.tcx;
+        let closure_argument_type = Ty::new_mut_ref(tcx, tcx.lifetimes.re_static, closure_type);
+        let element_argument_type = Ty::new_imm_ref(tcx, tcx.lifetimes.re_static, element_type);
+        let closure_argument = (Path::get_as_path(closure.clone()), closure);
+        let actual_argument_types = vec![closure_argument_type, element_argument_type];
+        let argument_map = generic_arguments.and_then(|args| {
+            self.type_visitor()
+                .get_generic_arguments_map(def_id, args, &actual_argument_types)
+        });
+
+        let first_index: Rc<AbstractValue> = Rc::new((*cursor).into());
+        let first_element_path = Path::new_index(data_path.clone(), first_index);
+        let first_element = AbstractValue::make_reference(first_element_path.clone());
+        let preflight_args = vec![
+            closure_argument.clone(),
+            (first_element_path, first_element),
+        ];
+        let function_constant_args = self
+            .block_visitor
+            .get_function_constant_args(&preflight_args, &actual_argument_types);
+        let environment_before_call = self.block_visitor.bv.current_environment.clone();
+        let mut block_visitor = BlockVisitor::new(self.block_visitor.bv);
+        let mut preflight_call_visitor = CallVisitor::new(
+            &mut block_visitor,
+            def_id,
+            generic_arguments,
+            argument_map.clone(),
+            environment_before_call,
+            ConstantDomain::Function(func_ref.clone()),
+        );
+        preflight_call_visitor.actual_args = preflight_args;
+        preflight_call_visitor.actual_argument_types = actual_argument_types.clone();
+        preflight_call_visitor.function_constant_args = &function_constant_args;
+        preflight_call_visitor.callee_fun_val = closure_argument.1.clone();
+        let Some(summary) = preflight_call_visitor.get_function_summary() else {
+            return false;
+        };
+        if !summary.is_computed || summary.is_incomplete {
+            return false;
+        }
+
+        let capture_free = match closure_type.kind() {
+            TyKind::Closure(_, args) => args.as_closure().upvar_tys().is_empty(),
+            TyKind::FnDef(..) => true,
+            _ => false,
+        };
+        let return_path = Path::new_result();
+        let result_only = summary
+            .side_effects
+            .iter()
+            .all(|(path, _)| **path == *return_path || path.is_rooted_by(&return_path));
+        if !capture_free || !summary.preconditions.is_empty() || !result_only {
+            return false;
+        }
+
+        let result_length = match &length.expression {
+            Expression::CompileTimeConstant(ConstantDomain::U128(length)) if cursor <= length => {
+                Rc::new((length - cursor).into())
+            }
+            _ if *cursor == 0 => length,
+            _ => return false,
+        };
+        let result_path = self.block_visitor.visit_rh_place(&self.destination);
+        self.block_visitor
+            .bv
+            .update_value_at(Path::new_length(result_path), result_length);
         self.use_entry_condition_as_exit_condition();
         true
     }
